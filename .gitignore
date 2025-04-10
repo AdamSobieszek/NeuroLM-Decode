@@ -1,0 +1,6 @@
+ckpt-*
+**/__pycache__
+thinking-out-loud
+tuh
+backups
+.DS_Store

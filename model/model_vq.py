@@ -14,6 +14,7 @@ from model.norm_ema_quantizer import NormEMAVectorQuantizer
 from torch.autograd import Function
 
 from model.model_neural_transformer import NTConfig
+import numpy as np
 
 class ReverseLayerF(Function):
     @staticmethod
@@ -107,27 +108,28 @@ class VQ(nn.Module):
             nn.Linear(self.embed_dim, self.embed_dim * 2),
             nn.BatchNorm1d(1024),
             nn.GELU(),
-            nn.Linear(self.embed_dim * 2, self.embed_dim),
-            nn.BatchNorm1d(1024),
-            nn.GELU(),
-            nn.Linear(self.embed_dim, self.latent_dim),
-            nn.BatchNorm1d(1024),
-            nn.Tanh(),
-            nn.Linear(self.latent_dim, self.latent_dim),
+            nn.Linear(self.embed_dim*2, self.latent_dim),
             nn.BatchNorm1d(1024),
             nn.Tanh(),
         )
+        # self.downcast_layer = nn.Sequential(
+        #     nn.Linear(self.embed_dim, self.latent_dim),
+        #     nn.Tanh(),
+        # )
         self.downcast_layer.apply(self._init_weights)
+        # self.upcast_layer = nn.Sequential(
+        #     nn.Linear(self.latent_dim, self.embed_dim),
+        #     nn.Tanh(),
+        #     nn.Linear(self.embed_dim, self.embed_dim) # for quantize
+        # )
+        # self.upcast_layer.apply(self._init_weights)
         
         # Symmetrical upcast layer for balanced upscaling
         self.upcast_layer = nn.Sequential(
-            nn.Linear(self.latent_dim, self.latent_dim * 2),
+            nn.Linear(self.latent_dim, self.embed_dim * 2),
             nn.BatchNorm1d(1024),
             nn.GELU(),
-            nn.Linear(self.latent_dim * 2, self.embed_dim),
-            nn.BatchNorm1d(1024),
-            nn.GELU(),
-            nn.Linear(self.embed_dim, self.embed_dim * 2),
+            nn.Linear(self.embed_dim * 2, self.embed_dim * 2),
             nn.BatchNorm1d(1024),
             nn.GELU(),
             nn.Linear(self.embed_dim * 2, self.embed_dim),
@@ -135,6 +137,10 @@ class VQ(nn.Module):
             nn.Tanh(),
         )
         self.upcast_layer.apply(self._init_weights)
+        decoder_args = dict(n_layer=4, n_head=4, n_embd=128, block_size=1024,
+                bias=False, dropout=0.0, num_classes=0, in_chans=128, out_chans=16)
+        decoder_conf = NTConfig(**decoder_args)
+        self.upcast_decoder = NeuralTransformer(decoder_conf)
              
         
     @property
@@ -151,19 +157,21 @@ class VQ(nn.Module):
     def encode(self, x, input_chans=None, input_time=None, mask=None):
         batch_size, n, t = x.shape
         encoder_features = self.encoder(x, input_chans, input_time, mask, return_all_tokens=True)
-
+        # print(">>>>>>>>>", encoder_features.shape)
         with torch.cuda.amp.autocast(enabled=False):
             to_quantizer_features = self.encode_task_layer(encoder_features.type_as(self.encode_task_layer[-1].weight))
-        print(to_quantizer_features.shape)
+        # print(to_quantizer_features.shape)
         quantize = self.downcast_layer(to_quantizer_features)
-        print(quantize.shape)
+        # print(quantize.shape)
         return quantize, None, None, encoder_features
         
     def decode(self, quantize, input_chans=None, input_time=None, mask=None, **kwargs):
         # reshape tokens to feature maps for patch embed in decoder
-        print(quantize.shape)
+        # print(quantize.shape)
         quantize = self.upcast_layer(quantize)
-        print(quantize.shape)
+        # print(quantize.shape)
+        quantize = quantize+self.upcast_decoder(quantize, input_chans, input_time, mask, return_all_tokens=True)
+        # print(quantize.shape)
         decoder_features_freq = self.decoder_freq(quantize, input_chans, input_time, mask, return_all_tokens=True)
         decoder_features_raw = self.decoder_raw(quantize, input_chans, input_time, mask, return_all_tokens=True)
         rec_freq = self.decode_task_layer_freq(decoder_features_freq)
@@ -181,7 +189,7 @@ class VQ(nn.Module):
     def calculate_rec_loss(self, rec, target):
         rec_loss = self.loss_fn(rec, target)
         return rec_loss
-
+    
     def forward(self, x, y_freq, y_raw, input_chans=None, input_time=None, input_mask=None, return_reconstruction=False, **kwargs):
         """
         x: shape [B, N, T]
@@ -190,16 +198,64 @@ class VQ(nn.Module):
         quantize, _, _, encoder_features = self.encode(x, input_chans, input_time, mask)
         
         xrec_freq, xrec_raw = self.decode(quantize, input_chans, input_time, mask)
+        
+            
         loss_freq_mask = input_mask.unsqueeze(-1).repeat(1, 1, xrec_freq.size(-1))
         loss_raw_mask = input_mask.unsqueeze(-1).repeat(1, 1, xrec_raw.size(-1))
         rec_freq_loss = self.calculate_rec_loss(xrec_freq * loss_freq_mask, y_freq)
         rec_raw_loss = self.calculate_rec_loss(xrec_raw * loss_raw_mask, y_raw)
-        loss = rec_freq_loss + rec_raw_loss
+
+        # Calculate per-window losses for visualization
+        batch_size, n_windows = x.shape[0], x.shape[1]
+        window_freq_losses = []
+        window_raw_losses = []
+        
+        # Calculate loss per window across the batch
+        for window_idx in range(n_windows):
+            # Extract window-specific losses
+            window_freq_loss = ((xrec_freq[:, window_idx] - y_freq[:, window_idx])**2).mean(dim=[0, 1])
+            window_raw_loss = ((xrec_raw[:, window_idx] - y_raw[:, window_idx])**2).mean(dim=[0, 1])
+            
+            window_freq_losses.append(window_freq_loss.item())
+            window_raw_losses.append(window_raw_loss.item())
+        
+        # Create visualization plot
+        import matplotlib.pyplot as plt
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        
+        # Plot frequency domain reconstruction loss
+        ax1.plot(range(n_windows), window_freq_losses, 'b-', marker='o')
+        ax1.set_title('Frequency Domain Reconstruction Loss per Window')
+        ax1.set_xlabel('Window Index')
+        ax1.set_ylabel('Loss')
+        ax1.grid(True)
+        
+        # Plot raw domain reconstruction loss
+        ax2.plot(range(n_windows), window_raw_losses, 'r-', marker='o')
+        ax2.set_title('Raw Domain Reconstruction Loss per Window')
+        ax2.set_xlabel('Window Index')
+        ax2.set_ylabel('Loss')
+        ax2.grid(True)
+        
+        plt.tight_layout()
+        
+        # Add plot to tensorboard if available
+        split = "train" if self.training else "val"
         log = {}
-        split="train" if self.training else "val"
         log[f'{split}/rec_freq_loss'] = rec_freq_loss.detach().mean()
         log[f'{split}/rec_raw_loss'] = rec_raw_loss.detach().mean()
         log[f'{split}/total_loss'] = loss.detach().mean()
+        
+        # Add figure to log if using a logger that supports figures
+        if hasattr(self, 'logger') and hasattr(self.logger, 'experiment'):
+            try:
+                self.logger.experiment.add_figure(f'{split}/loss_per_window', fig, self.global_step)
+            except:
+                pass
+        
+        plt.close(fig)
+        
+        loss = rec_freq_loss + rec_raw_loss
 
         if not return_reconstruction:
             return loss, encoder_features, log
@@ -335,7 +391,7 @@ class VQ_Align(nn.Module):
         # Categorize parameters by name and dimension
         for name, p in param_dict.items():
             # Parameters for encoder output layer and decoder input layer
-            if 'encode_task_layer' in name or 'invert_encode_task_layer' in name:
+            if 'cast_' in name:
                 ae_params.append(p)
             # Standard weight decay for 2D+ parameters that aren't in the AE interfaces
             elif p.dim() >= 2:
