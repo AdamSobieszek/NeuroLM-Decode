@@ -7,7 +7,47 @@ from torch.utils.data import Dataset
 import torch
 from einops import rearrange
 import pickle
+def reshape_data_by_channels(data, num_channels=23):
+    if len(data.shape)==2:
+        data=data.unsqueeze(0)
+    batch_size, num_tokens, time_samples = data.shape
+    
+    # Calculate how many tokens per channel we have
+    tokens_per_channel = num_tokens // num_channels
+    
+    # Create output tensor
+    reshaped_data = torch.zeros((batch_size, num_channels, tokens_per_channel * time_samples))
+    
+    reshaped_data = data[:,:tokens_per_channel*num_channels].reshape(batch_size, num_channels, tokens_per_channel * time_samples)
+    return reshaped_data
 
+def inverse_reshape_data_by_channels(reshaped_data, time_samples=200, num_channels=23):
+    batch_size, _, total_length = reshaped_data.shape
+    tokens_per_channel = total_length // time_samples
+    num_tokens = tokens_per_channel * num_channels
+    
+    # Create output tensor
+    original_data = torch.zeros((batch_size, num_tokens, time_samples))
+    original_data = reshaped_data.reshape(batch_size, num_tokens, time_samples)
+    
+    return original_data
+
+def std_norm(x):
+        mean = torch.mean(x, dim=(0, 1), keepdim=True)
+        std = torch.std(x, dim=(0, 1), keepdim=True)
+        x = (x - mean) / std
+        return x
+
+def norm_whole_channels(data, num_channels=23):
+    if len(data.shape)==2:
+        data=data.unsqueeze(0)
+    batch_size, num_tokens, time_samples = data.shape
+    reshaped_data = reshape_data_by_channels(data, num_channels)
+    reshaped_data = std_norm(reshaped_data)
+    reshaped_data = inverse_reshape_data_by_channels(reshaped_data)
+
+    return reshaped_data 
+     
 
 standard_1020 = [
     'FP1', 'FPZ', 'FP2', 
@@ -54,14 +94,15 @@ class PickleLoader(Dataset):
     def __getitem__(self, index):
         sample = pickle.load(open(self.files[index], "rb"))
         data = sample["X"]
+
         ch_names = sample["ch_names"]
         data = torch.FloatTensor(data / 100)
-
         time = data.size(1) // 200
         input_time = [i  for i in range(time) for _ in range(data.size(0))]
 
         data = rearrange(data, 'N (A T) -> (A N) T', T=200)
-        
+        # data = norm_whole_channels(data).squeeze()
+
         X = torch.zeros((self.block_size, 200))
         X[:data.size(0)] = data
 
@@ -70,8 +111,8 @@ class PickleLoader(Dataset):
             Y_raw = torch.zeros((self.block_size, 200))
             x_fft = torch.fft.fft(data, dim=-1)
             amplitude = torch.abs(x_fft)
-            amplitude = self.std_norm(amplitude)
-            Y_freq[:data.size(0)] = amplitude[:, :100]
+            amplitude = (amplitude)
+            Y_freq[:data.size(0)] = torch.log(amplitude[:, :100])
             Y_raw[:data.size(0)] = self.std_norm(data)
         
         # input_chans is the indices of the channels in the standard_1020 list

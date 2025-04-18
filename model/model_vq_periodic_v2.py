@@ -1,6 +1,5 @@
 """
-by Wei-Bang Jiang
-https://github.com/935963004/NeuroLM
+VQ model with trainable alpha parameter and minimum frequency constraint for high frequencies
 """
 
 import torch
@@ -9,11 +8,9 @@ import torch.nn.functional as F
 import inspect
 
 from model.model_neural_transformer import NeuralTransformer
-from model.norm_ema_quantizer import NormEMAVectorQuantizer
- 
-from torch.autograd import Function
-
+from model.model_periodic_transformer import PeriodicTransformerDecoder
 from model.model_neural_transformer import NTConfig
+from torch.autograd import Function
 import numpy as np
 
 class ReverseLayerF(Function):
@@ -28,6 +25,41 @@ class ReverseLayerF(Function):
         return output, None
 
 
+class ExpertAverage(torch.autograd.Function):
+    """
+    Custom autograd function for weighted average of two models' outputs.
+    Takes direct weight 'a' (not alpha) and controls gradient flow.
+    
+    forward: output = a * output1 + (1-a) * output2
+    """
+    
+    @staticmethod
+    def forward(ctx, output1, output2, a, passthrough_fraction=0):
+        # Compute weighted average directly
+        result = (1 - a) * output1 + a * output2
+        
+        # Save for backward pass
+        ctx.save_for_backward(output1, output2, a)
+        ctx.passthrough_fraction = passthrough_fraction
+        
+        return result
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Retrieve saved tensors and options
+        output1, output2, a = ctx.saved_tensors
+        passthrough_fraction = ctx.passthrough_fraction
+        
+        # Gradient for output1: grad_output * a
+        grad_output1 = grad_output*(0.5*(1-passthrough_fraction)+(1-a)*passthrough_fraction)
+        grad_output2 = grad_output*(0.5*(1-passthrough_fraction)+(a)*passthrough_fraction)
+        
+        # Gradient a is calculated as:
+        # d_result/d_a = output1 - output2
+        grad_a = torch.ones_like(a)*torch.sum(grad_output * (output2 - output1))
+
+        return grad_output1, grad_output2, grad_a, None
+
 class VQ(nn.Module):
     def __init__(self,
                  encoder_config,
@@ -38,7 +70,7 @@ class VQ(nn.Module):
                  decay=0.99,
                  quantize_kmeans_init=False,
                  decoder_out_dim=200,
-                 smooth_l1_loss = False,
+                 smooth_l1_loss=False,
                  **kwargs
                  ):
         super().__init__()
@@ -47,17 +79,16 @@ class VQ(nn.Module):
             print(f"Rewrite the in_chans in decoder from {decoder_config.in_chans} to {embed_dim}")
             decoder_config.in_chans = embed_dim
 
-        # encoder & decode params
+        # encoder & decoder params
         print('Final encoder config', encoder_config)
         self.encoder = NeuralTransformer(encoder_config)
 
         print('Final decoder config', decoder_config)
         self.decoder_freq = NeuralTransformer(decoder_config)
         self.decoder_raw = NeuralTransformer(decoder_config)
-                
-        # self.quantize = NormEMAVectorQuantizer(
-        #     n_embed=n_embed, embedding_dim=embed_dim, beta=1.0, kmeans_init=quantize_kmeans_init, decay=decay,
-        # )
+        
+        # Store decoder config for later use
+        self.decoder_config = decoder_config
 
         self.decoder_out_dim = decoder_out_dim
 
@@ -98,10 +129,6 @@ class VQ(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
             
-    # @torch.jit.ignore
-    # def no_weight_decay(self):
-    #     return {'quantize.embedding.weight', 'decoder.pos_embed', 'decoder.time_embed', 
-    #             'encoder.pos_embed', 'encoder.time_embed'}
     def init_ae_layer(self):
         # Enhanced downcast layer with BatchNorm and GELU activations
         self.downcast_layer = nn.Sequential(
@@ -112,17 +139,7 @@ class VQ(nn.Module):
             nn.BatchNorm1d(1024),
             nn.Tanh(),
         )
-        # self.downcast_layer = nn.Sequential(
-        #     nn.Linear(self.embed_dim, self.latent_dim),
-        #     nn.Tanh(),
-        # )
         self.downcast_layer.apply(self._init_weights)
-        # self.upcast_layer = nn.Sequential(
-        #     nn.Linear(self.latent_dim, self.embed_dim),
-        #     nn.Tanh(),
-        #     nn.Linear(self.embed_dim, self.embed_dim) # for quantize
-        # )
-        # self.upcast_layer.apply(self._init_weights)
         
         # Symmetrical upcast layer for balanced upscaling
         self.upcast_layer = nn.Sequential(
@@ -137,156 +154,200 @@ class VQ(nn.Module):
             nn.Tanh(),
         )
         self.upcast_layer.apply(self._init_weights)
-        decoder_args = dict(n_layer=4, n_head=4, n_embd=128, block_size=1024,
-                bias=False, dropout=0.0, num_classes=0, in_chans=128, out_chans=16)
-        decoder_conf = NTConfig(**decoder_args)
-        self.upcast_decoder = NeuralTransformer(decoder_conf)
-             
         
-    @property
-    def device(self):
-        return self.decoder.cls_token.device
-    
-    def get_number_of_tokens(self):
-        return self.quantize.n_e
-
-    # def get_tokens(self, data, input_chans=None, input_times=None, mask=None, **kwargs):
-    #     quantize, _, loss, _ = self.encode(data, input_chans, input_times, mask)
-    #     return embed_ind.view(data.size(0), data.size(1))
-
-    def encode(self, x, input_chans=None, input_time=None, mask=None):
-        batch_size, n, t = x.shape
-        encoder_features = self.encoder(x, input_chans, input_time, mask, return_all_tokens=True)
-        # print(">>>>>>>>>", encoder_features.shape)
-        with torch.cuda.amp.autocast(enabled=False):
-            to_quantizer_features = self.encode_task_layer(encoder_features.type_as(self.encode_task_layer[-1].weight))
-        # print(to_quantizer_features.shape)
-        quantize = self.downcast_layer(to_quantizer_features)
-        # print(quantize.shape)
-        return quantize, None, None, encoder_features
+        # Input dimension adjustment layer for concatenated inputs
+        self.sigmodule_input_proj = nn.Sequential(
+            nn.Linear(self.embed_dim + self.decoder_config.n_embd, self.decoder_out_dim),
+            nn.LayerNorm(self.decoder_out_dim),
+            nn.GELU()
+        )
+        self.sigmodule_input_proj.apply(self._init_weights)
         
-    def decode(self, quantize, input_chans=None, input_time=None, mask=None, **kwargs):
-        # reshape tokens to feature maps for patch embed in decoder
-        # print(quantize.shape)
-        quantize = self.upcast_layer(quantize)
-        # print(quantize.shape)
-        quantize = quantize+self.upcast_decoder(quantize, input_chans, input_time, mask, return_all_tokens=True)
-        # print(quantize.shape)
-        decoder_features_freq = self.decoder_freq(quantize, input_chans, input_time, mask, return_all_tokens=True)
-        decoder_features_raw = self.decoder_raw(quantize, input_chans, input_time, mask, return_all_tokens=True)
+        # Add the optimized periodic transformer module for raw signal processing
+        # Now with minimum frequency parameter for high-frequency focus
+        self.sigmodule_periodic_decoder_raw = PeriodicTransformerDecoder(
+            input_dim=self.decoder_out_dim,
+            hidden_dim=768,
+            num_layers=4,
+            num_heads=12,
+            dropout=0.1,
+            freq_bands=6,
+            min_alpha=258.0  # Set minimum frequency parameter to focus on high frequencies
+        )
+        self.sigmodule_periodic_decoder_raw.apply(self._init_weights)
+        
+        # Add trainable alpha parameter that starts at 0
+        # This controls the contribution of the periodic decoder to the final output
+        self.sigmodule_alpha = nn.Parameter(torch.zeros(1) - 5.0)  # Start with -5 for very low sigmoid value
+        
+        # self.sigmodule_alpha.register_hook(lambda grad: grad * 1000.0)
+        
+    def forward(self, x, y_freq, y_raw, input_chans=None, input_time=None, input_mask=None, return_reconstruction=False, return_partial_reconstructions = False, **kwargs):
+        """
+        Forward pass with weighted contribution from periodic decoder
+        x: shape [B, N, T]
+        """
+        mask = input_mask.unsqueeze(1).repeat(1, x.size(1), 1).unsqueeze(1) if input_mask is not None else None
+        
+        # Encode the input signal
+        quantize, _, _, encoder_features = self.encode(x, input_chans, input_time, mask)
+        
+        # Upcast the latent representation to the decoder's expected dimension
+        upcast_output = self.upcast_layer(quantize)
+        
+        # Get decoder outputs, but not yet processed through task layers
+        decoder_features_freq = self.decoder_freq(upcast_output, input_chans, input_time, mask, return_all_tokens=True)
+        decoder_features_raw = self.decoder_raw(upcast_output, input_chans, input_time, mask, return_all_tokens=True)
+        
+        # Generate the base reconstructions through task layers
         rec_freq = self.decode_task_layer_freq(decoder_features_freq)
         rec_raw = self.decode_task_layer_raw(decoder_features_raw)
         
-        return rec_freq, rec_raw
+        # No enhancement for frequency
+        final_freq = rec_freq
+        
+        # Create concatenated input for periodic decoder: upcast_output + decoder_features_raw
+        # [B, N, embed_dim + decoder.n_embd]
+        concat_input = torch.cat([upcast_output, decoder_features_raw], dim=-1)
+        
+        # Project the concatenated input to the expected dimension
+        projected_input = self.sigmodule_input_proj(concat_input)
+        
+        # Process through the periodic transformer decoder
+        # The decoder now focuses on high-frequency components due to min_alpha
+        periodic_output = self.sigmodule_periodic_decoder_raw(
+            projected_input, 
+            mask=input_mask if input_mask is not None else None
+        )
+        
+        # Get current value of alpha, clamped between 0 and 1
+        alpha = torch.sigmoid(self.sigmodule_alpha)
+        
+        # Final raw output is a weighted combination:
+        # At the beginning (alpha ≈ 0): final_raw ≈ rec_raw
+        # A decoupled learning process updates alpha to suitable value with final_raw = rec_raw*(1-alpha) + periodic_output*alpha
+        with torch.no_grad():
+            is_it_bad = abs(alpha-0.5)*2
+        final_raw = ExpertAverage.apply(rec_raw, periodic_output, alpha, is_it_bad)
+        # final_raw = (1-alpha)*rec_raw + alpha*periodic_output
+        # Apply mask and calculate losses
+        if input_mask is not None:
+            loss_freq_mask = input_mask.unsqueeze(-1).repeat(1, 1, final_freq.size(-1))
+            loss_raw_mask = input_mask.unsqueeze(-1).repeat(1, 1, final_raw.size(-1))
+            
+            rec_freq_loss = self.calculate_rec_loss(final_freq * loss_freq_mask, y_freq)
+            rec_raw_loss = self.calculate_rec_loss(final_raw * loss_raw_mask, y_raw)
+        else:
+            rec_freq_loss = self.calculate_rec_loss(final_freq, y_freq)
+            rec_raw_loss = self.calculate_rec_loss(final_raw, y_raw)
+        
+        # Calculate total loss - higher weight on frequency loss as it's often more stable
+        loss = rec_freq_loss + rec_raw_loss
+        
+        # Log metrics
+        log = {}
+        split = "train" if self.training else "val"
+        
+        log[f'{split}/rec_freq_loss'] = rec_freq_loss.detach().mean()
+        log[f'{split}/rec_raw_loss'] = rec_raw_loss.detach().mean() 
+        log[f'{split}/total_loss'] = loss.detach().mean()
+        # log[f'{split}/alpha'] = alpha.detach()  # Track alpha value during training
     
-    # def get_codebook_indices(self, x, input_chans=None, input_time=None, input_mask=None, **kwargs):
-    #     if input_mask is None:
-    #         mask = None
-    #     else:
-    #         mask = input_mask.unsqueeze(1).repeat(1, x.size(1), 1).unsqueeze(1)
-    #     return self.get_tokens(x, input_chans, input_time, mask, **kwargs)
+        if return_partial_reconstructions:
+            print((final_freq, final_raw, (1-alpha)*rec_raw, alpha*periodic_output))
+            return (final_freq, final_raw, (1-alpha)*rec_raw, alpha*periodic_output), encoder_features, log
+        elif not return_reconstruction:
+            return loss, encoder_features, log
+        else:
+            return (final_freq, final_raw), encoder_features, log
+
+    
+    
+    # Add to your VQ class
+    def force_update_alpha(self, new_value=0.0):
+        """Force-update the alpha parameter for debugging"""
+        # Find alpha parameter
+        for name, param in self.named_parameters():
+            if 'alpha' in name.lower():
+                # print(f"Forcing update to {name}")
+                # print(f"  Old value: {param.data.item()}")
+                with torch.no_grad():
+                    param.data.fill_(new_value)
+                # print(f"  New value: {param.data.item()}")
+                return True
+        
+        print("Alpha parameter not found!")
+        return False
+
+    
+    @property
+    def device(self):
+        return self.decoder_freq.cls_token.device if hasattr(self.decoder_freq, 'cls_token') else next(self.parameters()).device
+    
+    def encode(self, x, input_chans=None, input_time=None, mask=None):
+        encoder_features = self.encoder(x, input_chans, input_time, mask, return_all_tokens=True)
+        
+        with torch.cuda.amp.autocast(enabled=False):
+            to_quantizer_features = self.encode_task_layer(encoder_features.type_as(self.encode_task_layer[-1].weight))
+        
+        quantize = self.downcast_layer(to_quantizer_features)
+        return quantize, None, None, encoder_features
     
     def calculate_rec_loss(self, rec, target):
         rec_loss = self.loss_fn(rec, target)
         return rec_loss
     
-    def forward(self, x, y_freq, y_raw, input_chans=None, input_time=None, input_mask=None, return_reconstruction=False, **kwargs):
-        """
-        x: shape [B, N, T]
-        """
-        mask = input_mask.unsqueeze(1).repeat(1, x.size(1), 1).unsqueeze(1)
-        quantize, _, _, encoder_features = self.encode(x, input_chans, input_time, mask)
-        
-        xrec_freq, xrec_raw = self.decode(quantize, input_chans, input_time, mask)
-        
-            
-        loss_freq_mask = input_mask.unsqueeze(-1).repeat(1, 1, xrec_freq.size(-1))
-        loss_raw_mask = input_mask.unsqueeze(-1).repeat(1, 1, xrec_raw.size(-1))
-        rec_freq_loss = self.calculate_rec_loss(xrec_freq * loss_freq_mask, y_freq)
-        rec_raw_loss = self.calculate_rec_loss(xrec_raw * loss_raw_mask, y_raw)
-
-        # Calculate per-window losses for visualization
-        batch_size, n_windows = x.shape[0], x.shape[1]
-        window_freq_losses = []
-        window_raw_losses = []
-        
-        # Calculate loss per window across the batch
-        for window_idx in range(n_windows):
-            # Extract window-specific losses
-            window_freq_loss = ((xrec_freq[:, window_idx] - y_freq[:, window_idx])**2).mean(dim=[0, 1])
-            window_raw_loss = ((xrec_raw[:, window_idx] - y_raw[:, window_idx])**2).mean(dim=[0, 1])
-            
-            window_freq_losses.append(window_freq_loss.item())
-            window_raw_losses.append(window_raw_loss.item())
-        
-        # Create visualization plot
-        import matplotlib.pyplot as plt 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-        
-        # Plot frequency domain reconstruction loss
-        ax1.plot(range(n_windows), window_freq_losses, 'b-', marker='o')
-        ax1.set_title('Frequency Domain Reconstruction Loss per Window')
-        ax1.set_xlabel('Window Index')
-        ax1.set_ylabel('Loss')
-        ax1.grid(True)
-        
-        # Plot raw domain reconstruction loss
-        ax2.plot(range(n_windows), window_raw_losses, 'r-', marker='o')
-        ax2.set_title('Raw Domain Reconstruction Loss per Window')
-        ax2.set_xlabel('Window Index')
-        ax2.set_ylabel('Loss')
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        
-        # Add plot to tensorboard if available
-        split = "train" if self.training else "val"
-        log = {}
-        log[f'{split}/rec_freq_loss'] = rec_freq_loss.detach().mean()
-        log[f'{split}/rec_raw_loss'] = rec_raw_loss.detach().mean()
-        log[f'{split}/total_loss'] = loss.detach().mean()
-        
-        # Add figure to log if using a logger that supports figures
-        if hasattr(self, 'logger') and hasattr(self.logger, 'experiment'):
-            try:
-                self.logger.experiment.add_figure(f'{split}/loss_per_window', fig, self.global_step)
-            except:
-                pass
-        
-        plt.close(fig)
-        
-        loss = rec_freq_loss + rec_raw_loss
-
-        if not return_reconstruction:
-            return loss, encoder_features, log
-        else:
-            return (xrec_freq, xrec_raw), encoder_features,log
-    
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
+        # Start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
+        # Filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        
+        # Categorize parameters
+        ae_params = []
+        sigmodule_params = []
+        decay_params = []
+        nodecay_params = []
+        
+        # Categorize parameters by name and dimension
+        for name, p in param_dict.items():
+            if 'cast_' in name:
+                ae_params.append(p)
+            elif 'sigmodule' in name:
+                sigmodule_params.append(p)
+            elif p.dim() >= 2:
+                decay_params.append(p)
+            else:
+                nodecay_params.append(p)
+        
+        # Configure optimization groups
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+            {'params': decay_params, 'weight_decay': weight_decay, 'lr': learning_rate},
+            {'params': nodecay_params, 'weight_decay': 0.0, 'lr': learning_rate},
+            {'params': ae_params, 'weight_decay': weight_decay, 'lr': learning_rate},
+            # Give higher learning rate to the periodic transformer to accelerate its training
+            {'params': sigmodule_params, 'weight_decay': weight_decay, 'lr': learning_rate},
         ]
+            
+        # Print parameter counts for debugging
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
+        num_ae_params = sum(p.numel() for p in ae_params)
+        num_sigmodule_params = sum(p.numel() for p in sigmodule_params)
+        print(f"Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"Num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        print(f"Num AE interface parameters: {len(ae_params)}, with {num_ae_params:,} parameters")
+        print(f"Num sigmodule parameters: {len(sigmodule_params)}, with {num_sigmodule_params:,} parameters")
+        
+        # Create optimizer
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
+        print(f"Using fused AdamW: {use_fused}")
+        
         return optimizer
+    
         
 def load_model(ckpt_path, device):
     """
@@ -341,19 +402,6 @@ class VQ_Align(nn.Module):
         else:
             self.VQ = VQ(encoder_config, decoder_config)
         
-        # self.domain_classifier = nn.Sequential(
-        #         nn.Linear(decoder_config.n_embd, 256),
-        #         nn.GELU(),
-        #         nn.Linear(256, 2)
-        #     )
-        
-
-        # model_hf = GPT2LMHeadModel.from_pretrained('gpt2')
-        # sd_hf = model_hf.state_dict()
-        # self.wte = nn.Embedding(50257, 768, _freeze=True)
-        # self.wte.weight.data = sd_hf['transformer.wte.weight']
-        
-        # self.domain_classifier.apply(self._init_weights)
     
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -385,6 +433,7 @@ class VQ_Align(nn.Module):
         # Identify AE parameters more precisely - look for specific parameter names
         # that belong to the encoder-decoder interface layers
         ae_params = []
+        sigmodule_params = []
         decay_params = []
         nodecay_params = []
         
@@ -393,6 +442,8 @@ class VQ_Align(nn.Module):
             # Parameters for encoder output layer and decoder input layer
             if 'cast_' in name:
                 ae_params.append(p)
+            elif 'sigmodule' in name:
+                sigmodule_params.append(p)
             # Standard weight decay for 2D+ parameters that aren't in the AE interfaces
             elif p.dim() >= 2:
                 decay_params.append(p)
@@ -402,20 +453,21 @@ class VQ_Align(nn.Module):
         
         # Configure optimization groups with appropriate learning rates and weight decay
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay/2, 'lr': learning_rate},
+            {'params': decay_params, 'weight_decay': weight_decay, 'lr': learning_rate},
             {'params': nodecay_params, 'weight_decay': 0.0, 'lr': learning_rate},
-            # Higher learning rate but moderate weight decay for AE interface layers
-            # to allow faster adaptation without causing instability
             {'params': ae_params, 'weight_decay': weight_decay, 'lr': learning_rate},
+            {'params': sigmodule_params, 'weight_decay': weight_decay, 'lr': learning_rate},
             ]
             
         # Print parameter counts for debugging
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         num_ae_params = sum(p.numel() for p in ae_params)
+        num_sigmodule_params = sum(p.numel() for p in sigmodule_params)
         print(f"Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"Num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         print(f"Num AE interface parameters: {len(ae_params)}, with {num_ae_params:,} parameters")
+        print(f"Num sigmodule parameters: {len(sigmodule_params)}, with {num_sigmodule_params:,} parameters")
         
         # Create AdamW optimizer and use the fused version if available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
@@ -425,3 +477,5 @@ class VQ_Align(nn.Module):
         print(f"Using fused AdamW: {use_fused}")
         
         return optimizer
+
+    
