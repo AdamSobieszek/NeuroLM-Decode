@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import inspect
 
 from model.model_neural_transformer import NeuralTransformer
-from model.model_periodic_transformer_v3 import PeriodicTransformerDecoder
+from model.model_periodic_transformer import PeriodicTransformerDecoder
 from model.model_neural_transformer import NTConfig
 from torch.autograd import Function
 import numpy as np
@@ -281,17 +281,78 @@ class VQ(nn.Module):
         
         # Add trainable alpha parameter that starts at 0
         # This controls the contribution of the periodic decoder to the final output
-        self.sigmodule_alpha = nn.Parameter(torch.zeros(1) +1e-5)  # Start with 0.00001 for very low averaged
+        self.sigmodule_alpha = nn.Parameter(torch.zeros(1) - 5.0)  # Start with -5 for very low sigmoid value
         
         # self.sigmodule_alpha.register_hook(lambda grad: grad * 1000.0)
      
-    def std_norm(self, x):
-            mean = torch.mean(x, dim=(0, 1), keepdim=True)
-            std = torch.std(x, dim=(0, 1), keepdim=True)
-            x = (x - mean) / std
+
+    def std_norm(self, x, dim=(0,1)):
+            eps = 1e-10
+            mean = torch.mean(x, dim=dim, keepdim=True)
+            std = torch.std(x, dim=dim, keepdim=True)
+            x = (x - mean) / (std+eps)
             return x
 
+    
+    def reshape_data_by_channels(self, data, ch_names, num_channels=23):
+        batch_size, num_tokens, time_samples = data.shape
+        
+        # Calculate how many tokens per channel we have
+        tokens_per_channel = num_tokens // num_channels
+        
+        # Create output tensor
+        reshaped_data = data[:,:tokens_per_channel*num_channels].view(batch_size, num_channels, tokens_per_channel * time_samples)
+        
+        return reshaped_data
+    
+    def inverse_reshape_data_by_channels(self, reshaped_data, ch_names, time_samples=200, num_channels=23):
+        batch_size, _, total_length = reshaped_data.shape
+        tokens_per_channel = total_length // time_samples
+        num_tokens = tokens_per_channel * num_channels
+        
+        # Create output tensor
 
+        original_data = reshaped_data.view(batch_size, num_tokens, time_samples)
+        
+        return original_data
+        
+    def norm_whole_channels(self, data, input_mask, num_channels=23):
+        """
+        Fully differentiable implementation to normalize data only where mask is True (1)
+        without using any Python loops
+        
+        Args:
+            data: The data tensor with shape [B, N, T]
+            input_mask: A boolean mask with shape [B, N] indicating which tokens to normalize
+            num_channels: Number of channels in the data
+            
+        Returns:
+            Normalized data tensor with the same shape as input
+        """
+        batch_size, num_tokens, time_samples = data.shape
+        
+        # If no mask is provided, normalize everything
+        if input_mask is None:
+            reshaped_data = self.reshape_data_by_channels(data, None, num_channels)
+            reshaped_data = self.std_norm(reshaped_data, 2)
+            normalized_data = self.inverse_reshape_data_by_channels(reshaped_data, None)
+            return torch.cat([normalized_data, data[:, normalized_data.size(1):]], dim=1) if normalized_data.size(1) < data.size(1) else normalized_data
+        
+        normalized_data = data[input_mask].reshape(batch_size, num_channels, -1)
+        
+        # Calculate how many tokens we can reshape properly
+        valid_tokens = normalized_data.size(2)//200*num_channels
+        
+        normalized_data = self.std_norm(normalized_data, 2)
+        
+        normalized_data = normalized_data.reshape(batch_size, valid_tokens, time_samples)
+        
+        # If the original data had more tokens than what we processed, concatenate them
+        if valid_tokens < num_tokens:
+            normalized_data = torch.cat([normalized_data, data[:, valid_tokens:]], dim=1)
+        
+        return normalized_data
+        
     def forward(self, x, y_freq, y_raw, input_chans=None, input_time=None, input_mask=None, return_reconstruction=False, return_partial_reconstructions = False, **kwargs):
         """
         Forward pass with weighted contribution from periodic decoder
@@ -308,6 +369,8 @@ class VQ(nn.Module):
         # Get decoder outputs, but not yet processed through task layers
         decoder_features_freq = self.decoder_freq(upcast_output, input_chans, input_time, mask, return_all_tokens=True)
         decoder_features_raw = self.decoder_raw(upcast_output, input_chans, input_time, mask, return_all_tokens=True)
+
+
         
         # Generate the base reconstructions through task layers
         rec_freq = self.decode_task_layer_freq(decoder_features_freq)
@@ -332,17 +395,19 @@ class VQ(nn.Module):
             projected_input, 
             mask=input_mask if input_mask is not None else None
         )
-        periodic_output_mean = torch.mean(x, dim=(0, 1), keepdim=True)
-        periodic_output = (periodic_output - periodic_output_mean)
+        # periodic_output_mean = torch.mean(x, dim=(0, 1), keepdim=True)
+        # periodic_output = (periodic_output - periodic_output_mean)
         
         # Get current value of alpha, clamped between 0 and 1
-        alpha = torch.abs(self.sigmodule_alpha) #torch.sigmoid
-        rec_raw = self.std_norm(rec_raw)    
-
+        alpha = torch.abs(self.sigmodule_alpha)
+        # Apply normalization only to the masked parts
+        # rec_raw = self.norm_whole_channels(rec_raw, input_mask)
         
-        # final_raw = ExpertAverage.apply(rec_raw, periodic_output, alpha, 0)
+        # Combine raw reconstruction with periodic output
         final_raw = rec_raw + alpha*periodic_output
-        final_raw = self.std_norm(final_raw)
+        
+        # Normalize the final raw output also only for masked parts
+        # final_raw = self.norm_whole_channels(final_raw, input_mask)
 
         # Apply mask and calculate losses
         if input_mask is not None:
@@ -373,6 +438,7 @@ class VQ(nn.Module):
             return loss, encoder_features, log
         else:
             return (final_freq, final_raw), encoder_features, log
+
 
     
     # Add to your VQ class

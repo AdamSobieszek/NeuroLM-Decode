@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import inspect
 
 from model.model_neural_transformer import NeuralTransformer
-from model.model_periodic_transformer import PeriodicTransformerDecoder
+from model.model_periodic_transformer_old import PeriodicTransformerDecoder
 from model.model_neural_transformer import NTConfig
 from torch.autograd import Function
 import numpy as np

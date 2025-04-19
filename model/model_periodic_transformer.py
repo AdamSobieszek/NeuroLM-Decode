@@ -1,6 +1,6 @@
 """
 Periodic Transformer module with Snake activation for signal processing
-Updated to use dilated convolutions and transposed convolutions inspired by BigVGAN
+Updated to correctly handle different tensor layouts in convolutional and transformer components
 """
 
 import math
@@ -10,15 +10,29 @@ import torch.nn.functional as F
 
 
 class SnakeActivation(nn.Module):
-    """Snake activation with learnable frequency parameter"""
+    """Snake activation with learnable frequency parameter for transformer format [B, T, C]"""
     def __init__(self, in_features, alpha_init=1.0):
         super().__init__()
         # Initialize alpha directly with alpha_init
         self.alpha = nn.Parameter(torch.ones(in_features) * alpha_init)
         
     def forward(self, x):
-        # Standard Snake activation without minimum constraint
-        return x + (1.0 / self.alpha) * torch.sin(self.alpha * x) ** 2
+        # Standard Snake activation for transformer format [B, T, C]
+        return x + (1.0 / self.alpha) * torch.sin(self.alpha * x) ** 2  
+
+
+class SnakeActivation1D(nn.Module):
+    """Snake activation with learnable frequency parameter for CNN format [B, C, T]"""
+    def __init__(self, channels, alpha_init=1.0):
+        super().__init__()
+        # Initialize alpha directly with alpha_init
+        self.alpha = nn.Parameter(torch.ones(channels) * alpha_init)
+        
+    def forward(self, x):
+        # For CNN format [B, C, T], alpha needs to be reshaped for proper broadcasting
+        # Need to reshape alpha to [1, C, 1] to broadcast against [B, C, T]
+        alpha_reshaped = self.alpha.view(1, -1, 1)
+        return x + (1.0 / alpha_reshaped) * torch.sin(alpha_reshaped * x) ** 2
 
 
 class LowPassFilter(nn.Module):
@@ -40,26 +54,15 @@ class LowPassFilter(nn.Module):
         return filter_kernel.view(1, 1, -1) / filter_kernel.sum()
     
     def forward(self, x):
-        # Ensure we have the right shape for 1D convolution [B, C, T]
-        orig_shape = x.shape
-        if len(orig_shape) == 3 and orig_shape[2] > orig_shape[1]:  # [B, C, T]
-            x_reshaped = x
-        else:  # [B, T, C]
-            x_reshaped = x.transpose(1, 2)
-        
+        # Assumes input is in CNN format [B, C, T]
         # Apply filter to each channel independently
         x_filtered = F.conv1d(
-            x_reshaped, 
-            self.filter.repeat(x_reshaped.size(1), 1, 1), 
+            x, 
+            self.filter.repeat(x.size(1), 1, 1), 
             padding=self.kernel_size//2, 
-            groups=x_reshaped.size(1)
+            groups=x.size(1)
         )
-        
-        # Return to original shape if needed
-        if len(orig_shape) == 3 and orig_shape[2] > orig_shape[1]:  # Was already [B, C, T]
-            return x_filtered
-        else:  # Was [B, T, C]
-            return x_filtered.transpose(1, 2)
+        return x_filtered
 
 
 class AMPFeedForward(nn.Module):
@@ -85,8 +88,10 @@ class AMPFeedForward(nn.Module):
         # Process through MLP with Snake activation
         h = self.net(x)
         
-        # Apply low-pass filter (anti-aliasing)
-        h_filtered = self.low_pass(h)
+        # Transpose for low-pass filtering [B, T, C] -> [B, C, T]
+        h_conv = h.transpose(1, 2)
+        h_filtered = self.low_pass(h_conv)
+        h_filtered = h_filtered.transpose(1, 2)  # Back to [B, T, C]
         
         # Residual connection and normalization
         x = x + h_filtered
@@ -113,9 +118,9 @@ class AMPBlock(nn.Module):
             for d in dilation_rates
         ])
         
-        # Snake activations for each conv layer
+        # Snake activations for convolutional format
         self.activations = nn.ModuleList([
-            SnakeActivation(channels, alpha_init=snake_alpha_init * (1.0 + 0.25 * i))
+            SnakeActivation1D(channels, alpha_init=snake_alpha_init * (1.0 + 0.25 * i))
             for i in range(len(dilation_rates))
         ])
         
@@ -136,7 +141,7 @@ class AMPBlock(nn.Module):
         # Process through each dilated conv with activation
         for conv, activation, low_pass in zip(self.convs, self.activations, self.low_pass_filters):
             # Apply activation and then convolution
-            x_act = activation(x.transpose(1, 2)).transpose(1, 2)  # [B, T, C] -> [B, C, T]
+            x_act = activation(x)  # Already in [B, C, T] format
             x_conv = conv(x_act)
             # Apply low-pass filter
             x_filtered = low_pass(x_conv)
@@ -180,41 +185,25 @@ class PeriodicTransformerDecoder(nn.Module):
     """
     Transformer decoder with periodic inductive bias for signal generation.
     Includes transposed convolutions and dilated convolutions inspired by BigVGAN.
-    
-    Parameters:
-    -----------
-    input_dim : int
-        Dimension of the input signal
-    hidden_dim : int
-        Internal dimension of the transformer
-    num_layers : int
-        Number of transformer layers
-    num_heads : int
-        Number of attention heads per layer
-    dropout : float
-        Dropout probability
-    freq_bands : int
-        Number of frequency bands for the output
     """
     def __init__(self, 
                 input_dim=200,
-                hidden_dim=512,
+                hidden_dim=384,
                 num_layers=4,
-                num_heads=12,
+                num_heads=6,
                 dropout=0.1,
                 freq_bands=6):
         super().__init__()
         
         # Store parameters
         self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
         self.freq_bands = freq_bands
         
-        # Initial transposed 1D convolution (upsampling step from BigVGAN)
-        self.initial_transpose_conv = nn.Sequential(
-            nn.Conv1d(input_dim, hidden_dim, kernel_size=1),  # Project to hidden_dim
-            nn.ConvTranspose1d(hidden_dim, hidden_dim, kernel_size=4, stride=2, padding=1),  # Upsample
-            SnakeActivation(hidden_dim),
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1)  # Adjust channels
+        # Simple 1D convolution to adjust dimensions - more stable than transposed conv
+        self.input_projection = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size=1),
+            SnakeActivation1D(hidden_dim, alpha_init=1.0)
         )
         
         # AMP Block for periodic signal processing
@@ -225,8 +214,8 @@ class PeriodicTransformerDecoder(nn.Module):
             snake_alpha_init=1.0
         )
         
-        # Project back to transformer format
-        self.conv_to_transformer = nn.Linear(hidden_dim, hidden_dim)
+        # Projection back to transformer format
+        self.projection = nn.Linear(hidden_dim, hidden_dim)
         
         # Periodic transformer layers with progressively varying frequency initialization
         self.layers = nn.ModuleList([
@@ -238,76 +227,77 @@ class PeriodicTransformerDecoder(nn.Module):
             ) for i in range(num_layers)
         ])
         
-        # Multi-band frequency decomposition
-        # Each band uses a different initialization for the Snake activation
-        self.freq_extractors = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                SnakeActivation(hidden_dim // 2, alpha_init=1.0 + 0.5 * i),  # Different frequencies
-                nn.Linear(hidden_dim // 2, input_dim // self.freq_bands + (1 if i < input_dim % self.freq_bands else 0))
-            ) for i in range(self.freq_bands)
-        ])
+        # Final frequency band extractors
+        # Calculate base size and remainder for even distribution
+        base_size = input_dim // freq_bands
+        remainder = input_dim % freq_bands
         
-        # Band mixer with attention to learn optimal combination of frequency bands
+        # Create extractors with appropriate output sizes
+        self.freq_extractors = nn.ModuleList()
+        for i in range(freq_bands):
+            # Add an extra feature to some bands if needed for exact dimension matching
+            output_size = base_size + (1 if i < remainder else 0)
+            
+            self.freq_extractors.append(nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                SnakeActivation(hidden_dim // 2, alpha_init=1.0 + 0.5 * i),
+                nn.Linear(hidden_dim // 2, output_size)
+            ))
+        
+        # Band mixer with attention to learn optimal combination
         self.band_mixer = nn.Sequential(
-            nn.Linear(hidden_dim, self.freq_bands),
+            nn.Linear(hidden_dim, freq_bands),
             nn.Softmax(dim=-1)
         )
-        
-        # Final output projection
-        self.output_proj = nn.Linear(input_dim, input_dim)
-        
+
     def forward(self, x, mask=None):
+        """
+        Forward pass for the periodic transformer decoder
+        x: tensor of shape [batch_size, seq_len, input_dim]
+        mask: optional mask for the transformer
+        """
         # Store original shape for verification
         original_shape = x.shape
-        batch_size, seq_len, feat_dim = x.shape
+        batch_size, seq_len, _ = x.shape
         
-        # Process through initial transposed convolution
-        # First transpose to [B, D, T] for convolutional layers
-        x_conv = x.transpose(1, 2)  # [B, T, D] -> [B, D, T]
-        x_conv = self.initial_transpose_conv(x_conv)  # Apply transposed conv
+        # Convert to convolutional format [B, C, T]
+        x_conv = x.transpose(1, 2)
         
-        # Apply AMP Block with dilated convolutions
+        # Apply input projection
+        x_conv = self.input_projection(x_conv)
+        
+        # Apply AMP block with dilated convolutions
         x_conv = self.amp_block(x_conv)
         
-        # Transpose back to transformer format [B, T', D]
-        # Note: The sequence length might be different due to upsampling
-        x_conv = x_conv.transpose(1, 2)
+        # Convert back to transformer format [B, T, C]
+        x_trans = x_conv.transpose(1, 2)
         
-        # Downsample back to original sequence length if needed
-        if x_conv.size(1) != seq_len:
-            x_conv = F.interpolate(x_conv.transpose(1, 2), size=seq_len, mode='linear', align_corners=False)
-            x_conv = x_conv.transpose(1, 2)
-            
-        # Project back to transformer hidden dimension
-        x = self.conv_to_transformer(x_conv)
+        # Apply projection to transformer hidden dim
+        x_trans = self.projection(x_trans)
         
         # Process through transformer layers
         for layer in self.layers:
-            x = layer(x, mask)
+            x_trans = layer(x_trans, mask)
         
-        # Extract attention weights for frequency bands
-        band_weights = self.band_mixer(x)  # [B, seq_len, freq_bands]
+        # Extract band weights for frequency mixing
+        band_weights = self.band_mixer(x_trans)  # [B, T, freq_bands]
         
         # Generate multiple frequency bands
         freq_components = []
-        for i, freq_extractor in enumerate(self.freq_extractors):
+        for i, extractor in enumerate(self.freq_extractors):
             # Extract this frequency band
-            component = freq_extractor(x)
+            component = extractor(x_trans)  # [B, T, output_size]
             
-            # Weight by the attention weights
-            weight = band_weights[:, :, i].unsqueeze(-1)
+            # Apply band weighting
+            weight = band_weights[:, :, i].unsqueeze(-1)  # [B, T, 1]
             weighted_component = component * weight
             
             freq_components.append(weighted_component)
         
-        # Combine frequency bands into final output
+        # Concatenate frequency bands to form final output
         output = torch.cat(freq_components, dim=-1)
         
-        # Always apply final projection to ensure exact dimension matching
-        output = self.output_proj(output)
-        
-        # Verify output shape matches original input shape
+        # Verify shape matches original input
         assert output.shape == original_shape, f"Output shape {output.shape} doesn't match input shape {original_shape}"
         
         return output
