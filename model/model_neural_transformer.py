@@ -140,3 +140,107 @@ class NeuralTransformer(nn.Module):
         x = self.forward_features(x, input_chans, input_times, mask, return_all_tokens=return_all_tokens, **kwargs)
         x = self.head(x)
         return x
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# your standard small 1D U‑Net
+class UNet1DDecoder(nn.Module):
+    def __init__(self, in_channels, out_channels, base_channels=64, depth=4):
+        super().__init__()
+        # down path
+        self.downs = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        ch = in_channels
+        for d in range(depth):
+            out_ch = base_channels * (2**d)
+            self.downs.append(nn.Sequential(
+                nn.Conv1d(ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm1d(out_ch), nn.GELU(),
+                nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm1d(out_ch), nn.GELU(),
+            ))
+            self.pools.append(nn.MaxPool1d(2))
+            ch = out_ch
+
+        # up path
+        self.ups = nn.ModuleList()
+        self.ups_convs = nn.ModuleList()
+        for d in reversed(range(depth)):
+            in_ch = ch
+            out_ch = base_channels * (2**d)
+            self.ups.append(nn.ConvTranspose1d(in_ch, out_ch, kernel_size=2, stride=2))
+            # after concat with skip, channels = out_ch*2
+            self.ups_convs.append(nn.Sequential(
+                nn.Conv1d(out_ch*2, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm1d(out_ch), nn.GELU(),
+                nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm1d(out_ch), nn.GELU(),
+            ))
+            ch = out_ch
+
+        self.final = nn.Conv1d(ch, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        # x: [B, T, C] -> [B, C, T]
+        x = x.transpose(1,2)
+        skips = []
+        for down, pool in zip(self.downs, self.pools):
+            x = down(x)
+            skips.append(x)
+            x = pool(x)
+        for up, upconv, skip in zip(self.ups, self.ups_convs, reversed(skips)):
+            x = up(x)
+            # pad if needed
+            if x.size(-1) != skip.size(-1):
+                x = F.pad(x, (0, skip.size(-1)-x.size(-1)))
+            x = torch.cat([x, skip], dim=1)
+            x = upconv(x)
+        x = self.final(x)
+        # back to [B, T, C_out]
+        return x.transpose(1,2)
+
+class HybridUNetDecoder(NeuralTransformer):
+    def __init__(self, config: NTConfig,
+                 unet_base_ch: int = 64,
+                 unet_depth: int = 4):
+        super().__init__(config)
+        # kill the old head, we’ll do our own reconstruction
+        self.head = nn.Identity()
+        self.unet = UNet1DDecoder(
+            in_channels  = config.n_embd,
+            out_channels = config.patch_size,
+            base_channels= unet_base_ch,
+            depth        = unet_depth
+        )
+
+    def forward(self,
+                x,                   # [B, seq_len, patch_size]
+                input_chans=None,
+                input_times=None,
+                mask=None,
+                return_all_tokens: bool = False,
+                **kwargs):
+        # 1) run the standard embedding + transformer encoder
+        #    but always ask for full-token output
+        feats = self.forward_features(
+            x,
+            input_chans,
+            input_times,
+            mask,
+            return_all_tokens=True
+        )  # => [B, seq_len, n_embd]
+
+        # 2) reconstruct waveform with U‑Net
+        recon = self.unet(feats)  # => [B, seq_len, patch_size]
+
+        # 3) exactly mirror the original return logic:
+        #    if they wanted all tokens, hand back the feature‐matrix,
+        #    otherwise hand back the reconstruction.
+        if return_all_tokens:
+            return feats       # exactly one tensor
+        else:
+            return recon       # exactly one tensor
+
