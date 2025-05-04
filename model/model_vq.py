@@ -609,14 +609,14 @@ class VQ(nn.Module):
         
         return optimizer
         
-def load_model(ckpt_path, device, periodic_decoder_config=None):
+def load_model(ckpt_path, device, periodic_decoder_conf=None):
     """
     Load the VQ_Align model from checkpoint
     """
     print(f"Loading model from checkpoint: {ckpt_path}")
     
     # Load checkpoint
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     
     # Get model configuration
     encoder_args = checkpoint['encoder_args']
@@ -641,12 +641,12 @@ def load_model(ckpt_path, device, periodic_decoder_config=None):
     
     # Initialize model
     
-    model = VQ_Align(encoder_conf, decoder_conf, periodic_decoder_config=periodic_decoder_config)
+    model = VQ_Align(encoder_conf, decoder_conf, periodic_decoder_conf=periodic_decoder_conf)
    
     # Load state dict
-    model.load_state_dict(state_dict, weights_only=True)
-    model = model.VQ
     model.init_ae_layer()
+    model.load_state_dict(state_dict)
+    model = model.VQ
     # print(model)
     return model
 
@@ -655,14 +655,14 @@ class VQ_Align(nn.Module):
                  encoder_config=None,
                  decoder_config=None,
                  checkpoint_path=None,
-                 periodic_decoder_config=None,
+                 periodic_decoder_conf=None,
                  ):
         super(VQ_Align, self).__init__()
         if checkpoint_path:
             print("LOADING VQ.pt CHECKPOINT\n\n\n\n-----------------")
-            self.VQ = load_model(checkpoint_path, "cuda", periodic_decoder_config)
+            self.VQ = load_model(checkpoint_path, "cuda", periodic_decoder_conf)
         else:
-            self.VQ = VQ(encoder_config, decoder_config, periodic_decoder_config=periodic_decoder_config)
+            self.VQ = VQ(encoder_config, decoder_config, periodic_decoder_conf=periodic_decoder_conf)
             self.VQ.init_ae_layer()
         
     
