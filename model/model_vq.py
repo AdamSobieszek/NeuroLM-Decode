@@ -177,6 +177,7 @@ class VQ(nn.Module):
                  smooth_l1_loss=False,
                  pl_weight=2.0,  # Weight for path length regularization
                  pl_decay=0.01,  # EMA decay for path length
+                 periodic_decoder_config=None,
                  **kwargs
                  ):
         super().__init__()
@@ -198,6 +199,7 @@ class VQ(nn.Module):
         
         # Store decoder config for later use
         self.decoder_config = decoder_config
+        self.periodic_decoder_config = {} if periodic_decoder_config is None else periodic_decoder_config 
 
         self.decoder_out_dim = decoder_out_dim
 
@@ -281,11 +283,12 @@ class VQ(nn.Module):
         # Now with minimum frequency parameter for high-frequency focus
         self.sigmodule_periodic_decoder_raw = PeriodicTransformerDecoder(
             input_dim=self.decoder_out_dim,
-            hidden_dim=768//2,
-            num_layers=4,
-            num_heads=12,
-            dropout=0.1,
-            freq_bands=6,
+            **({
+            'hidden_dim':768//2,
+            'num_layers':4,
+            'num_heads':12,
+            'dropout':0.1,
+            'freq_bands':6}|self.periodic_decoder_config)
         )
 
         self.sigmodule_periodic_decoder_raw.apply(self._init_weights)
@@ -606,7 +609,7 @@ class VQ(nn.Module):
         
         return optimizer
         
-def load_model(ckpt_path, device):
+def load_model(ckpt_path, device, periodic_decoder_config=None):
     """
     Load the VQ_Align model from checkpoint
     """
@@ -626,11 +629,7 @@ def load_model(ckpt_path, device):
     encoder_conf = NTConfig(**encoder_args)
     decoder_conf = NTConfig(**decoder_args)
     encoder_conf
-
-    
-    # Initialize model
-    model = VQ_Align(encoder_conf, decoder_conf)
-    
+ 
     # Fix state dict keys if needed
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
@@ -639,6 +638,11 @@ def load_model(ckpt_path, device):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     state_dict = {k:v for k,v in state_dict.items() if k not in ["domain_classifier.0.weight", "domain_classifier.0.bias", "domain_classifier.2.weight", "domain_classifier.2.bias", "wte.weight", "VQ.quantize.cluster_size", "VQ.quantize.embedding.weight", "VQ.quantize.embedding.cluster_size", "VQ.quantize.embedding.embed_avg", "VQ.quantize.embedding.initted"]}
     
+    
+    # Initialize model
+    
+    model = VQ_Align(encoder_conf, decoder_conf, periodic_decoder_config=periodic_decoder_config)
+   
     # Load state dict
     model.load_state_dict(state_dict)
     model = model.VQ
@@ -650,14 +654,15 @@ class VQ_Align(nn.Module):
     def __init__(self, 
                  encoder_config=None,
                  decoder_config=None,
-                 checkpoint_path=None
+                 checkpoint_path=None,
+                 periodic_decoder_config=None,
                  ):
         super(VQ_Align, self).__init__()
         if checkpoint_path:
             print("LOADING VQ.pt CHECKPOINT\n\n\n\n-----------------")
-            self.VQ = load_model(checkpoint_path, "cuda")
+            self.VQ = load_model(checkpoint_path, "cuda", periodic_decoder_config)
         else:
-            self.VQ = VQ(encoder_config, decoder_config)
+            self.VQ = VQ(encoder_config, decoder_config, periodic_decoder_config=periodic_decoder_config)
             self.VQ.init_ae_layer()
         
     
