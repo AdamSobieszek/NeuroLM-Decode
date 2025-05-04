@@ -635,7 +635,7 @@ def load_model(ckpt_path, device, periodic_decoder_conf=None):
     for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        if "sigmodule_periodic2_decoder_raw" in k
+        if "sigmodule_periodic2_decoder_raw" in k: # TODO remove in the future
             state_dict[k.replace("sigmodule_periodic2_decoder_raw", "sigmodule_periodic_decoder_raw")] = state_dict.pop(k)
     state_dict = {k:v for k,v in state_dict.items() if k not in ["domain_classifier.0.weight", "domain_classifier.0.bias", "domain_classifier.2.weight", "domain_classifier.2.bias", "wte.weight", "VQ.quantize.cluster_size", "VQ.quantize.embedding.weight", "VQ.quantize.embedding.cluster_size", "VQ.quantize.embedding.embed_avg", "VQ.quantize.embedding.initted"]}
     
