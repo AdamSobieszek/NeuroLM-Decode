@@ -655,15 +655,17 @@ class VQ_Align(nn.Module):
                  encoder_config=None,
                  decoder_config=None,
                  checkpoint_path=None,
+                 device="cuda",
                  periodic_decoder_conf=None,
                  ):
         super(VQ_Align, self).__init__()
         if checkpoint_path:
             print("LOADING VQ.pt CHECKPOINT\n\n\n\n-----------------")
-            self.VQ = load_model(checkpoint_path, "cuda", periodic_decoder_conf)
+            self.VQ = load_model(checkpoint_path, device, periodic_decoder_conf)
         else:
             self.VQ = VQ(encoder_config, decoder_config, periodic_decoder_conf=periodic_decoder_conf)
             self.VQ.init_ae_layer()
+            self.to(device)
         
     
     def _init_weights(self, m):
