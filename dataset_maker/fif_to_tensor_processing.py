@@ -12,7 +12,7 @@ import pandas as pd
 import json
 from typing import Tuple, Union, List
 import ast
-from src.data_utils.fif_to_fif_processing import process_fif_to_fif
+from dataset_maker.fif_to_fif_processing import process_fif_to_fif
 
 # for mne complaining about file names
 import warnings
