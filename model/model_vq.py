@@ -644,7 +644,7 @@ def load_model(ckpt_path, device, periodic_decoder_config=None):
     model = VQ_Align(encoder_conf, decoder_conf, periodic_decoder_config=periodic_decoder_config)
    
     # Load state dict
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, weights_only=True)
     model = model.VQ
     model.init_ae_layer()
     # print(model)
