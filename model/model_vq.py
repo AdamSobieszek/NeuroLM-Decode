@@ -628,7 +628,6 @@ def load_model(ckpt_path, device, periodic_decoder_conf=None):
     # Create model configuration
     encoder_conf = NTConfig(**encoder_args)
     decoder_conf = NTConfig(**decoder_args)
-    encoder_conf
  
     # Fix state dict keys if needed
     state_dict = checkpoint['model']
@@ -644,7 +643,6 @@ def load_model(ckpt_path, device, periodic_decoder_conf=None):
     model = VQ_Align(encoder_conf, decoder_conf, periodic_decoder_conf=periodic_decoder_conf)
    
     # Load state dict
-    model.init_ae_layer()
     model.load_state_dict(state_dict)
     model = model.VQ
     # print(model)
