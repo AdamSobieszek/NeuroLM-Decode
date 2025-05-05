@@ -609,7 +609,7 @@ class VQ(nn.Module):
         
         return optimizer
         
-def load_model(ckpt_path, device, periodic_decoder_conf=None):
+def load_model(ckpt_path, device, periodic_decoder_config=None):
     """
     Load the VQ_Align model from checkpoint
     """
@@ -643,7 +643,7 @@ def load_model(ckpt_path, device, periodic_decoder_conf=None):
     
     # Initialize model
     
-    model = VQ_Align(encoder_conf, decoder_conf, periodic_decoder_conf=periodic_decoder_conf)
+    model = VQ_Align(encoder_conf, decoder_conf, periodic_decoder_config=periodic_decoder_config)
    
     # Load state dict
     model.load_state_dict(state_dict)
@@ -657,14 +657,14 @@ class VQ_Align(nn.Module):
                  decoder_config=None,
                  checkpoint_path=None,
                  device="cuda",
-                 periodic_decoder_conf=None,
+                 periodic_decoder_config=None,
                  ):
         super(VQ_Align, self).__init__()
         if checkpoint_path:
             print("LOADING VQ.pt CHECKPOINT\n\n\n\n-----------------")
-            self.VQ = load_model(checkpoint_path, device, periodic_decoder_conf)
+            self.VQ = load_model(checkpoint_path, device, periodic_decoder_config)
         else:
-            self.VQ = VQ(encoder_config, decoder_config, periodic_decoder_conf=periodic_decoder_conf)
+            self.VQ = VQ(encoder_config, decoder_config, periodic_decoder_config=periodic_decoder_config)
             self.VQ.init_ae_layer()
             self.to(device)
         
