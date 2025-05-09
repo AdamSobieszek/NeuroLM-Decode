@@ -17,8 +17,9 @@ import torch._dynamo.config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model.model_vq_periodic_v2 import VQ_Align
+from model.model_vq import VQ_Align
 from model.model_neural_transformer import NTConfig
+# from InnerSpeechMVPv1.src.data_utils.neurolm_dataloaders import ThinkingOutLoudLoader as PickleLoader
 from dataset import PickleLoader
 from pathlib import Path
 from utils import cosine_scheduler
@@ -38,11 +39,11 @@ def signal_handler(sig, frame):
 
 
 def init(args):
-    global ctx, master_process, ddp, ddp_world_size, ddp_rank, device, dtype, device_type, ddp_local_rank
+    global ctx, master_process, ddp, ddp_world_size, ddp_rank, device, dtype, device_type, ddp_local_rank,dtype
     # various inits, derived attributes, I/O setup
     backend = 'nccl' # 'nccl', 'gloo', etc.
     device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-    dtype = 'float32' #'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+     #'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
     
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
     if ddp:
@@ -105,8 +106,10 @@ def main(args):
         os.makedirs(checkpoint_out_dir, exist_ok=True)
 
     print('prepare dataloader...')
-    files = Path(args.dataset_dir, 'train').rglob('*.pkl')
+    files = Path(args.dataset_dir).rglob('*.pkl')
     files = [file for file in files]
+    # tuh = Path("/workspace/tuh_full/train").rglob('*.pkl')
+    # files += [file for file in tuh]
     dataset_train = PickleLoader(files)
     print('finished!')
 
@@ -174,27 +177,18 @@ def main(args):
             # determine the vocab size we'll use for from-scratch training
             encoder_conf = NTConfig(**encoder_args)
             decoder_conf = NTConfig(**decoder_args)
-            model = VQ_Align(encoder_conf, decoder_conf, "/workspace/VQ.pt")
+            model = VQ_Align(encoder_conf, decoder_conf, "/workspace/VQ.pt", periodic_decoder_config={"hidden_dim":384})
             start_epoch = 0
         elif init_from == 'resume':
             print(f"Resuming training from {checkpoint_out_dir}")
             # resume training from a checkpoint.
-            checkpoint = torch.load(ckpt_path, map_location=device)
+            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
             # create the model
             encoder_conf = NTConfig(**encoder_args)
             decoder_conf = NTConfig(**decoder_args)
-            model = VQ_Align(encoder_conf, decoder_conf, "/workspace/VQ.pt")
-            checkpoint = torch.load(ckpt_path, map_location=device)
-            
-            state_dict = checkpoint['model']
-            unwanted_prefix = '_orig_mod.'
-            for k, v in list(state_dict.items()):
-                if k.startswith(unwanted_prefix):
-                    state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-            state_dict = {k:v for k,v in state_dict.items() if k not in ["domain_classifier.0.weight", "domain_classifier.0.bias", "domain_classifier.2.weight", "domain_classifier.2.bias", "wte.weight", "VQ.quantize.cluster_size", "VQ.quantize.embedding.weight", "VQ.quantize.embedding.cluster_size", "VQ.quantize.embedding.embed_avg", "VQ.quantize.embedding.initted"]}
+            model = VQ_Align(encoder_conf, decoder_conf,ckpt_path, periodic_decoder_config={"hidden_dim":384})
             
             # Load state dict
-            model.load_state_dict(state_dict)
             iter_num = checkpoint['iter_num']
             start_epoch = checkpoint['epoch'] + 1
 
@@ -235,112 +229,118 @@ def main(args):
         )
         lr_schedule_values_delayed = cosine_scheduler(
                     args.learning_rate, args.min_lr, args.epochs, num_training_steps_per_epoch,
-                    warmup_epochs=args.warmup_epochs+5
+                    warmup_epochs=args.warmup_epochs
                 )
 
         # training loop
         t0 = time.time()
         local_iter_num = 0 # number of iterations in the lifetime of this process
         raw_model = model.module if ddp else model # unwrap DDP container if needed
-        losses = {"train/total_loss":[],"train/rec_freq_loss":[],"train/rec_raw_loss":[]}
-        
-        # model.VQ.force_update_alpha(-2.0)
-        for epoch in range(start_epoch, args.epochs):
+        losses = {}
+        iter_num = iter_num%(num_training_steps_per_epoch*args.epochs)
+        # model.VQ.force_update_alpha(-3.0)
+        for epoch in range(start_epoch, 100000):
             if not running:
                 break
                 
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
-            for step, (batch) in enumerate(data_loader_train):
-                if not running:
-                    break
+            try:
+                for step, (batch) in enumerate(data_loader_train):
+                    if not running:
+                        break
+                        
+                    # determine and set the learning rate for this iteration
+                    lr_fast = lr_schedule_values[iter_num] if args.decay_lr else args.learning_rate
+                    lr_slow = lr_schedule_values_delayed[iter_num] if args.decay_lr else args.learning_rate
+                    for lr,ii,param_group in zip([lr_slow,lr_slow,lr_fast,lr_fast,lr_fast], [1.,1., 1., 1., 200.], optimizer.param_groups):
+                        param_group['lr'] = lr*ii
+                        if ii == 1000 and step == 0 and epoch == start_epoch:
+                            print("domain classifier lr: ", param_group['lr'], "domain classifier weight decay: ", param_group['weight_decay'])
+
+                    # forward backward update, with optional gradient accumulation to simulate larger batch size
+                    # and using the GradScaler if data type is float16
+                    if ddp:
+                        # in DDP training we only need to sync gradients at the last micro step.
+                        # the official way to do this is with model.no_sync() context manager, but
+                        # I really dislike that this bloats the code and forces us to repeat code
+                        # looking at the source of that context manager, it just toggles this variable
+                        model.require_backward_grad_sync = (step + 1) % args.gradient_accumulation_steps == 0
                     
-                # determine and set the learning rate for this iteration
-                lr_fast = lr_schedule_values[iter_num] if args.decay_lr else args.learning_rate
-                lr_slow = lr_schedule_values_delayed[iter_num] if args.decay_lr else args.learning_rate
-                for lr,ii,param_group in zip([lr_slow,lr_slow,lr_fast,lr_fast], [1.,1., 1., 1.], optimizer.param_groups):
-                    param_group['lr'] = lr*ii
-
-                # forward backward update, with optional gradient accumulation to simulate larger batch size
-                # and using the GradScaler if data type is float16
-                if ddp:
-                    # in DDP training we only need to sync gradients at the last micro step.
-                    # the official way to do this is with model.no_sync() context manager, but
-                    # I really dislike that this bloats the code and forces us to repeat code
-                    # looking at the source of that context manager, it just toggles this variable
-                    model.require_backward_grad_sync = (step + 1) % args.gradient_accumulation_steps == 0
-                
-                X, Y_freq, Y_raw, input_chans, input_time, input_mask = batch
-                X = X.float().to(device, non_blocking=True).to(ptdtype)
-                Y_freq = Y_freq.float().to(device, non_blocking=True).to(ptdtype)
-                Y_raw = Y_raw.float().to(device, non_blocking=True).to(ptdtype)
-                input_chans = input_chans.to(device, non_blocking=True)
-                input_time = input_time.to(device, non_blocking=True)
-                input_mask = input_mask.to(device, non_blocking=True)
+                    X, Y_freq, Y_raw, input_chans, input_time, input_mask, target = batch
+                    X = X.float().to(device, non_blocking=True).to(ptdtype)
+                    Y_freq = Y_freq.float().to(device, non_blocking=True).to(ptdtype)
+                    Y_raw = Y_raw.float().to(device, non_blocking=True).to(ptdtype)
+                    input_chans = input_chans.to(device, non_blocking=True)
+                    input_time = input_time.to(device, non_blocking=True)
+                    input_mask = input_mask.to(device, non_blocking=True)
 
 
-                ################################
-                if np.random.random()>0.5:
-                    kernel_size, sigma = 30, 6
-                    noise = torch.randn_like(X)
-                    # Create a 1D Gaussian kernel
-                    kernel = torch.exp(-torch.arange(-(kernel_size//2), kernel_size//2 + 1)**2 / (2*sigma**2))**0.1
-                    kernel = kernel / kernel.sum()
-                    kernel = kernel.view(1, 1, -1).type_as(noise)
-                    while len(kernel.shape) < len(noise.shape):
-                        kernel = kernel.unsqueeze(0)
-                    noise = F.conv1d(
-                        noise.reshape(-1, 1, noise.shape[-1]),  # Reshape for conv1d
-                        kernel.to(noise.device),
-                        padding='same'
-                    ).view(noise.shape).to(X.device).to(X.dtype)
-                    abs_scale = X.std(dim=-1, keepdim=True)
-                    noise_scale_percent =  np.random.random()**2/3
-                    X = X*(1-noise_scale_percent)+ noise*(abs_scale)*noise_scale_percent
-                
-                with ctx:
-                    loss, _, log = model(X, Y_freq, Y_raw, input_chans, input_time, input_mask)
-                    for k,v in losses.items():
-                        v.append(log[k])
-                    if loss != loss:
-                        continue
-                        print("nan")
-                    #domain_loss2 = model(X_text)
-                    loss = (loss) / args.gradient_accumulation_steps # scale the loss to account for gradient accumulation
-                # immediately async prefetch next batch while model is doing the forward pass on the GPU
-                # backward pass, with gradient scaling if training in fp16
-                scaler.scale(loss).backward()
-                if (step + 1) % args.gradient_accumulation_steps == 0:
-                    # clip the gradient
-                    if args.grad_clip != 0.0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                    # print("Alpha value: ", model.VQ.sigmodule_alpha.data, "Alpha grad: ", model.VQ.sigmodule_alpha.grad.data)
-                    # step the optimizer and scaler if training in fp16
-                    scaler.step(optimizer)
-                    scaler.update()
-
-                    model.VQ.force_update_alpha((model.VQ.sigmodule_alpha.data.float() - model.VQ.sigmodule_alpha.grad.data.float()*2).item())
-                    optimizer.zero_grad(set_to_none=True)
+                    ################################
+                    if np.random.random()>0.5:
+                        kernel_size, sigma = 30, 6
+                        noise = torch.randn_like(X)
+                        # Create a 1D Gaussian kernel
+                        kernel = torch.exp(-torch.arange(-(kernel_size//2), kernel_size//2 + 1)**2 / (2*sigma**2))**0.1
+                        kernel = kernel / kernel.sum()
+                        kernel = kernel.view(1, 1, -1).type_as(noise)
+                        while len(kernel.shape) < len(noise.shape):
+                            kernel = kernel.unsqueeze(0)
+                        noise = F.conv1d(
+                            noise.reshape(-1, 1, noise.shape[-1]),  # Reshape for conv1d
+                            kernel.to(noise.device),
+                            padding='same'
+                        ).view(noise.shape).to(X.device).to(X.dtype)
+                        abs_scale = X.std(dim=-1, keepdim=True)
+                        noise_scale_percent =  np.random.random()**2/3
+                        X = X*(1-noise_scale_percent)+ noise*(abs_scale)*noise_scale_percent
                     
-                # evaluate the loss on train/val sets and wxrite checkpoints
-                if (iter_num + 1) % args.log_interval == 0 and master_process:
-                    M = lambda k: sum(losses[k])/len(losses[k])
-                    with torch.no_grad():
-                        _alpha = f"{model.VQ.sigmodule_alpha.data}"
-                    print(f"epoch {epoch} step [{step + 1}/{num_training_steps_per_epoch}]: train loss {M('train/total_loss'):.4f}, freq loss {M('train/rec_freq_loss'):.4f}, raw loss {M('train/rec_raw_loss'):.4f} |        lr: {lr:.7f}   [alpha={_alpha}]")
-                    losses = {"train/total_loss":[],"train/rec_freq_loss":[],"train/rec_raw_loss":[]}
+                    with ctx:
+                        loss, _, log = model(X, Y_freq, Y_raw, input_chans, input_time, input_mask, target=target)
+                        for k,v in log.items():
+                            if k not in losses:
+                                losses[k] = []
+                            losses[k].append(v)
+                        if loss != loss:
+                            continue
+                            print("nan")
+                        #domain_loss2 = model(X_text)
+                        loss = (loss) / args.gradient_accumulation_steps # scale the loss to account for gradient accumulation
+                    # immediately async prefetch next batch while model is doing the forward pass on the GPU
+                    # backward pass, with gradient scaling if training in fp16
+                    scaler.scale(loss).backward()
+                    if (step + 1) % args.gradient_accumulation_steps == 0:
+                        # clip the gradient
+                        if args.grad_clip != 0.0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                        # print("Alpha value: ", model.VQ.sigmodule_alpha.data, "Alpha grad: ", model.VQ.sigmodule_alpha.grad.data)
+                        # step the optimizer and scaler if training in fp16
+                        scaler.step(optimizer)
+                        scaler.update()
 
-                # timing and logging
-                t1 = time.time()
-                dt = t1 - t0
-                t0 = t1
+                        # model.VQ.forc
+                        # force_update_alpha((model.VQ.sigmodule_alpha.data.float()*0.99).item())
+                        optimizer.zero_grad(set_to_none=True)
+                        
+                    # evaluate the loss on train/val sets and wxrite checkpoints
+                    if (iter_num + 1) % args.log_interval == 0 and master_process:
+                        M = lambda k: sum(losses[k])/len(losses[k])
+                        with torch.no_grad():
+                            _alpha = f"{model.VQ.sigmodule_alpha.data}"
+                        print(f"epoch {epoch} step [{step + 1}/{num_training_steps_per_epoch}]: train loss {M('train/total_loss'):.4f}, freq loss {M('train/rec_freq_loss'):.4f}, raw loss {M('train/rec_raw_loss'):.4f} |        lr: {lr:.7f}   [alpha={_alpha}]")
+                        print(f"Domain loss: {M('train/domain_loss'):.4f}, Accuracy: {M('train/accuracy'):.4f}, Contrastive loss: {M('train/contrastive_loss'):.4f}, Similarity matrix: {M('train/similarity_matrix'):.4f}")
+                        losses = {}
 
-                iter_num += 1
-                local_iter_num += 1
-            
-            
+                    # timing and logging
+                    t1 = time.time()
+                    dt = t1 - t0
+                    t0 = t1
+                
+                    iter_num += 1
+                    local_iter_num += 1
+            except Exception as e:
+                print(f"Exception occurred: {e}")
+                raise e
+                continue
             if (epoch + 1) % args.save_ckpt_freq == 0 and master_process:
                 print(f"saving checkpoint {epoch} to {checkpoint_out_dir}")
                 torch.save({
@@ -354,13 +354,22 @@ def main(args):
 
     except Exception as e:
         print(f"Exception occurred: {e}")
-
-        print(iter_num, epoch)
+        print(iter_num, epoch, local_iter_num)
         
         # Save checkpoint on exception
-        if iter_num>10:
-            save_checkpoint(model, optimizer, encoder_args, decoder_args, iter_num, epoch, checkpoint_out_dir)
-        raise  # Re-raise the exception after saving
+        if local_iter_num>10:
+                print(f"saving checkpoint {epoch} to {checkpoint_out_dir}")
+                torch.save({
+                    'model': raw_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'encoder_args': encoder_args,
+                    'decoder_args': decoder_args,
+                    'iter_num': iter_num,
+                    'epoch': epoch
+                }, os.path.join(checkpoint_out_dir, f'ckpt-{epoch}.pt'))
+
+
+        raise e
 
     if ddp:
         destroy_process_group()
@@ -369,15 +378,15 @@ def get_args():
     parser = argparse.ArgumentParser('VQ training script', add_help=False)
     parser.add_argument('--out_dir', default='./', help='path where to save, empty for no saving')
     parser.add_argument('--dataset_dir', default='./', help='path where to save, empty for no saving')
-    parser.add_argument('--log_interval', default=75, type=int)
+    parser.add_argument('--log_interval', default=15, type=int)
     # training args
-    parser.add_argument('--gradient_accumulation_steps', default=12, type=int)
-    parser.add_argument('--batch_size', default=47, type=int)
+    parser.add_argument('--gradient_accumulation_steps', default=5*2, type=int)
+    parser.add_argument('--batch_size', default=50, type=int)
     parser.add_argument('--latent_dim', default=32, type=int)
     parser.add_argument('--text_batch_size', default=16, type=int)
     parser.add_argument('--epochs', default=100, type=int)
-    parser.add_argument('--warmup_epochs', default=2, type=int)
-    parser.add_argument('--save_ckpt_freq', default=1, type=int)
+    parser.add_argument('--warmup_epochs', default=0, type=int)
+    parser.add_argument('--save_ckpt_freq', default=3, type=int)
     parser.add_argument('--block_size', default=1024, type=int)
 
     parser.add_argument('--learning_rate', type=float, default=7e-5, metavar='LR',
@@ -385,9 +394,9 @@ def get_args():
     parser.add_argument('--min_lr', type=float, default=2e-6)
     parser.add_argument('--weight_decay', type=float, default=2e-4,
                         help='weight decay (default: 1e-4)')
-    parser.add_argument('--beta1', type=float, default=0.95)
+    parser.add_argument('--beta1', type=float, default=0.9)
     parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument('--grad_clip', type=float, default=0.0,
+    parser.add_argument('--grad_clip', type=float, default=3.0,
                         help='clip gradients at this value, or disable if == 0.0')
     parser.add_argument('--decay_lr', default=True, action='store_false')
     parser.add_argument('--seed', default=1337, type=int)
@@ -399,5 +408,7 @@ def get_args():
 
 if __name__ == '__main__':
     args = get_args()
+    dtype = 'float32' #'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+    
     main(args)
 

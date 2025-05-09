@@ -118,6 +118,7 @@ with torch.no_grad():
         plot_path = calculate_and_plot_fft_power(p_output, r_raw, fs=200)
         log[f'{split}/fft_plot_path'] = plot_path
 """
+
 class ReverseLayerF(Function):
     @staticmethod
     def forward(ctx, x, alpha):
@@ -128,6 +129,8 @@ class ReverseLayerF(Function):
     def backward(ctx, grad_output):
         output = grad_output.neg() * ctx.alpha
         return output, None
+
+
 
 class ExpertAverage(torch.autograd.Function):
     """
@@ -284,7 +287,7 @@ class VQ(nn.Module):
         self.sigmodule_periodic_decoder_raw = PeriodicTransformerDecoder(
             input_dim=self.decoder_out_dim,
             **({
-            'hidden_dim':768//2,
+            'hidden_dim':768//4,
             'num_layers':4,
             'num_heads':12,
             'dropout':0.1,
@@ -585,7 +588,7 @@ class VQ(nn.Module):
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay, 'lr': learning_rate},
             {'params': nodecay_params, 'weight_decay': 0.0, 'lr': learning_rate},
-            {'params': ae_params, 'weight_decay': weight_decay, 'lr': learning_rate},
+            {'params': ae_params, 'weight_decay': weight_decay*20, 'lr': learning_rate},
             # Give higher learning rate to the periodic transformer to accelerate its training
             {'params': sigmodule_params, 'weight_decay': weight_decay, 'lr': learning_rate},
         ]
@@ -640,13 +643,12 @@ def load_model(ckpt_path, device, periodic_decoder_config=None):
             state_dict[k.replace("sigmodule_periodic2_decoder_raw", "sigmodule_periodic_decoder_raw")] = state_dict.pop(k)
     state_dict = {k:v for k,v in state_dict.items() if k not in ["domain_classifier.0.weight", "domain_classifier.0.bias", "domain_classifier.2.weight", "domain_classifier.2.bias", "wte.weight", "VQ.quantize.cluster_size", "VQ.quantize.embedding.weight", "VQ.quantize.embedding.cluster_size", "VQ.quantize.embedding.embed_avg", "VQ.quantize.embedding.initted"]}
     
-    
     # Initialize model
     
     model = VQ_Align(encoder_conf, decoder_conf, periodic_decoder_config=periodic_decoder_config)
-   
+    model.VQ.init_ae_layer()
+    load_partial_state_dict(model,state_dict)
     # Load state dict
-    model.load_state_dict(state_dict)
     model = model.VQ
     # print(model)
     return model
@@ -667,7 +669,7 @@ class VQ_Align(nn.Module):
             self.VQ = VQ(encoder_config, decoder_config, periodic_decoder_config=periodic_decoder_config)
             self.VQ.init_ae_layer()
             self.to(device)
-        
+        self.domain_classifier = ThinkingOfLatents()
     
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -678,17 +680,144 @@ class VQ_Align(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
     
-    def forward(self, x, y_freq=None, y_raw=None, input_chans=None, input_time=None, input_mask=None, return_reconstruction=False):
+    def forward(self, x, y_freq=None, y_raw=None, input_chans=None, input_time=None, input_mask=None, return_reconstruction=False, target=None):
         if y_freq is not None:
+            # Existing code for primary VQ loss
             loss, encoder_features, log = self.VQ(x, y_freq, y_raw, input_chans, input_time, input_mask, return_reconstruction=False)
-            # reverse_x = ReverseLayerF.apply(encoder_features, alpha)
-            # domain_out = self.domain_classifier(reverse_x)
-            # target = torch.full((domain_out.size(0), domain_out.size(1)), fill_value=-1, device=x.device)
-            # target[input_mask == True] = 0
-            # domain_loss = F.cross_entropy(domain_out.view(-1, domain_out.size(-1)), target.view(-1), ignore_index=-1)
-            split="train" if self.training else "val"
-            # log[f'{split}/domain_loss'] = domain_loss.detach().item()
-            return loss, encoder_features, log
+            
+            # Initialize domain_loss and contrastive_loss
+            domain_loss = 0
+            contrastive_loss = 0
+            
+            if target is not None:
+                domain_out = self.domain_classifier(encoder_features)
+                
+                # Create a tensor filled with -1 as default (ignore_index for cross_entropy)
+                target_hot = torch.full((domain_out.size(0), domain_out.size(-1)), fill_value=-1, device=x.device)
+                
+                if all(target.isnan().flatten()):
+                    print('here')
+                    domain_loss = 0
+                else:
+                    try:
+                        # Get the number of classes from domain_out
+                        num_classes = domain_out.size(-1)
+                        # Convert integer labels to one-hot encoding
+                        target_hot = target_hot.unsqueeze(1).repeat((1,1024,1))
+                        input_mask[:,:62] = 0
+                        target_hot[input_mask == True] = 0
+                        for i in range(target.size(0)):
+                            if not torch.isnan(target[i]):
+                                label_idx = int(target[i].item())
+                                # Set the corresponding class to 1 (one-hot)
+                                if 0 <= label_idx < num_classes:
+                                    target_hot[i, :, label_idx] = 1
+                        input_mask_ignore = input_mask.clone()
+                        input_mask_ignore[:,:62] = 0
+                        target_hot[input_mask_ignore == 0] = -1
+                        
+                        domain_loss = F.cross_entropy(domain_out.float(), target_hot.float(), ignore_index=-1)/1024
+                        
+                        # Calculate accuracy
+                        with torch.no_grad():
+                            domain_out = domain_out[input_mask == True].view(-1,4)
+                            target_hot = target_hot[input_mask == True].view(-1,4)
+                            predictions = torch.argmax(domain_out, dim=-1)
+                            correct = 0
+                            total = 0
+                            for i in range(predictions.size(0)):
+                                    true_label = torch.argmax(target_hot[i]) if target_hot.dim() > 1 else target_hot[i]
+                                    pred = predictions[i]
+                                    correct += (pred == true_label).item()
+                                    total += 1
+                            accuracy = correct / total if total > 0 else 0
+                        
+                        split="train" if self.training else "val"
+
+                    except Exception as e:
+                        print(e)
+                        
+                # --- New contrastive learning loss ---
+                try:
+                    if not all(target.isnan().flatten()):
+                        # Get valid indices (non-NaN targets)
+                        valid_indices = ~torch.isnan(target).flatten()
+                        if valid_indices.sum() > 1:  # Need at least 2 valid samples for contrastive learning
+                            valid_targets = target[valid_indices].long()
+                            
+                            # Average the encoder features for each sample to get a single vector per sample
+                            # Shape: [batch_size, feature_dim]
+                            if input_mask is not None:
+                                # Use masked average pooling to get sample embeddings
+                                mask_expanded = input_mask.unsqueeze(-1).expand_as(encoder_features)
+                                mask_expanded[:,:62] = 0
+                                masked_features = encoder_features * mask_expanded
+                                mask_sum = mask_expanded.sum(dim=1, keepdim=True).clamp(min=1e-9)
+                                sample_embeddings = (masked_features.sum(dim=1) / mask_sum.squeeze(1))
+                            else:
+                                # Simple average pooling if no mask
+                                sample_embeddings = encoder_features.mean(dim=1)
+                            
+                            valid_embeddings = sample_embeddings[valid_indices]
+                            
+                            # Normalize embeddings for cosine similarity
+                            normalized_embeddings = F.normalize(valid_embeddings, p=2, dim=1)
+                            
+                            # Compute all pairwise similarities
+                            similarities = torch.matmul(normalized_embeddings, normalized_embeddings.t())
+                            
+                            # Create mask for positive pairs (same class)
+                            pos_mask = (valid_targets.unsqueeze(1) == valid_targets.unsqueeze(0)).float()
+                            # Remove self-similarities from positive mask
+                            pos_mask.fill_diagonal_(0)
+                            
+                            # Create mask for negative pairs (different class)
+                            neg_mask = (valid_targets.unsqueeze(1) != valid_targets.unsqueeze(0)).float()
+                            
+                            # Temperature parameter for scaling
+                            temperature = 0.1
+                            
+                            # Compute contrastive loss using InfoNCE / NT-Xent loss formulation
+                            similarities = similarities / temperature
+                            
+                            # For each anchor, compute loss
+                            contrastive_losses = []
+                            for i in range(len(valid_embeddings)):
+                                pos_similarities = similarities[i][pos_mask[i] > 0]
+                                neg_similarities = similarities[i][neg_mask[i] > 0]
+                                
+                                if len(pos_similarities) > 0 and len(neg_similarities) > 0:
+                                    # Compute log_prob: log(exp(pos_sim) / (exp(pos_sim) + sum(exp(neg_sim))))
+                                    pos_exp = torch.exp(pos_similarities)
+                                    neg_exp = torch.exp(neg_similarities).sum()
+                                    
+                                    # InfoNCE loss for this anchor
+                                    anchor_loss = -torch.log(pos_exp / (pos_exp + neg_exp)).mean()
+                                    contrastive_losses.append(anchor_loss)
+                            
+                            if contrastive_losses:
+                                contrastive_loss = torch.stack(contrastive_losses).mean()
+                                
+                                # Add to log
+                                
+                except Exception as e:
+                    print(f"Contrastive loss error: {e}")
+                    contrastive_loss = 0
+            
+            similarity_matrix = (self.domain_classifier.weight_similarity_matrix().abs().sum()-4)/12
+            # print(f"Domain loss: {domain_loss:.5f}, Accuracy: {accuracy:.4f}, Contrastive loss: {contrastive_loss:.5f}, Similarity matrix: {similarity_matrix:.5f}")
+                     
+            log[f'{split}/similarity_matrix'] = similarity_matrix
+            log[f'{split}/contrastive_loss'] = contrastive_loss.detach()
+            log[f'{split}/domain_loss'] = domain_loss.detach()
+            log[f'{split}/accuracy'] = accuracy
+            # Combine all losses with appropriate weighting
+            # You can adjust these weights as needed
+            lambda_domain = 1.0
+            lambda_contrastive = 1.0
+            total_loss = loss + lambda_domain * domain_loss + lambda_contrastive * contrastive_loss
+            
+            return total_loss, encoder_features, log
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # Start with all of the candidate parameters
@@ -702,11 +831,15 @@ class VQ_Align(nn.Module):
         sigmodule_params = []
         decay_params = []
         nodecay_params = []
+        domain_classifier_params = []
+        print('Loaded optimizer with domain_classifier')
         
         # Categorize parameters by name and dimension
         for name, p in param_dict.items():
             # Parameters for encoder output layer and decoder input layer
-            if 'cast_' in name:
+            if 'domain_classifier' in name:
+                domain_classifier_params.append(p)
+            elif 'cast_' in name:
                 ae_params.append(p)
             elif 'sigmodule' in name:
                 sigmodule_params.append(p)
@@ -723,6 +856,7 @@ class VQ_Align(nn.Module):
             {'params': nodecay_params, 'weight_decay': 0.0, 'lr': learning_rate},
             {'params': ae_params, 'weight_decay': weight_decay, 'lr': learning_rate},
             {'params': sigmodule_params, 'weight_decay': weight_decay, 'lr': learning_rate},
+            {'params': domain_classifier_params, 'weight_decay': weight_decay*100, 'lr': learning_rate},
             ]
             
         # Print parameter counts for debugging
@@ -743,7 +877,6 @@ class VQ_Align(nn.Module):
         print(f"Using fused AdamW: {use_fused}")
         
         return optimizer
-
 
 def load_partial_state_dict(model, state_dict, verbose=False):
     """
@@ -805,3 +938,200 @@ def load_partial_state_dict(model, state_dict, verbose=False):
     
     return stats
     
+class ThinkingOfLatents(torch.nn.Module):
+    """
+    A neural network module that transforms a hidden_dim-dimensional input into 4 outputs
+    using orthogonal linear projections.
+    
+    This module ensures orthogonality through its architecture rather than regularization,
+    by parameterizing the weight matrix as a product of a learnable matrix and an orthogonalization
+    transformation.
+    """
+    def __init__(self, hidden_dim=32):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        
+        # Instead of learning 4 separate linear layers, we learn a single matrix
+        # of shape [4, hidden_dim] and enforce orthogonality during forward pass
+        self.weight_params = torch.nn.Parameter(torch.randn(4, hidden_dim))
+        self.biases = torch.nn.Parameter(torch.zeros(4))
+        
+        # Initialize with semi-orthogonal weights
+        nn.init.orthogonal_(self.weight_params)
+    
+    def get_orthogonal_weights(self):
+        """
+        Transforms the learnable weight parameters into an orthogonal set of vectors
+        using QR decomposition.
+        
+        Returns:
+            torch.Tensor: Orthogonal weight matrix of shape [4, hidden_dim]
+        """
+        # QR decomposition: Q is an orthogonal matrix
+        q, r = torch.linalg.qr(self.weight_params.T)
+        
+        # q has shape [hidden_dim, 4], we need [4, hidden_dim]
+        orthogonal_weights = q.T
+        
+        # Adjust signs based on the diagonal of R to ensure consistent direction
+        signs = torch.sign(torch.diag(r))
+        orthogonal_weights = orthogonal_weights * signs.unsqueeze(1)
+        
+        return orthogonal_weights
+    
+    def forward(self, x):
+        """
+        Forward pass using orthogonal weight vectors.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape [..., hidden_dim]
+            
+        Returns:
+            torch.Tensor: Output tensor of shape [..., 4]
+        """
+        # Get orthogonal weights
+        weights = self.get_orthogonal_weights()
+        
+        # Apply linear transformation: x @ weights.T + biases
+        # For batched inputs, we need to handle the dimensions carefully
+        if x.dim() > 1:
+            output = torch.matmul(x, weights.T) + self.biases
+        else:
+            output = torch.matmul(x, weights.T) + self.biases
+            
+        return output
+
+    def weight_similarity_matrix(self):
+        """
+        Returns the matrix of cosine similarities between the orthogonal weight vectors.
+        For perfectly orthogonal vectors, this should be an identity matrix.
+        """
+        # Get orthogonal weights
+        weights = self.get_orthogonal_weights()
+        
+        # Normalize each weight vector (row) using L2 norm
+        normalized_weights = torch.nn.functional.normalize(weights, p=2, dim=1)
+        
+        # Compute cosine similarity matrix
+        similarity_matrix = torch.matmul(normalized_weights, normalized_weights.t())
+        
+        return similarity_matrix
+        
+
+class ThinkingOfLatents(torch.nn.Module):
+    """
+    A neural network module that transforms a 512-dimensional input into 4 outputs
+    using 4 separate single-layer linear transformations.
+    
+    This module is "linear" in the sense that the final output is a simple concatenation
+    of the outputs from four independent linear layers, each mapping from the input
+    dimension to a single output value.
+    """
+    def __init__(self, hidden_dim=32):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        
+        # Create four separate linear layers, each mapping from hidden_dim to 1
+        self.linear1 = torch.nn.Linear(hidden_dim, 1)
+        self.linear2 = torch.nn.Linear(hidden_dim, 1)
+        self.linear3 = torch.nn.Linear(hidden_dim, 1)
+        self.linear4 = torch.nn.Linear(hidden_dim, 1)
+    
+    def forward(self, x):
+        """
+        Forward pass through the PeriodicDecoder.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape [..., hidden_dim]
+            
+        Returns:
+            torch.Tensor: Output tensor of shape [..., 4] containing the concatenated
+                          outputs of the four linear layers
+        """
+        # Apply each linear layer separately
+        out1 = self.linear1(x)
+        out2 = self.linear2(x)
+        out3 = self.linear3(x)
+        out4 = self.linear4(x)
+        
+        # Concatenate the outputs along the last dimension
+        # Each output has shape [..., 1], so concatenating gives [..., 4]
+        return torch.cat([out1, out2, out3, out4], dim=-1).squeeze()
+
+    def weight_similarity_matrix(self):
+        """
+        Prints the matrix of normed dot products (cosine similarity)
+        between the weight vectors of the four linear layers.
+        """
+        # Collect and detach weights. Weights are of shape [1, hidden_dim].
+        # Squeeze to remove the first dimension of size 1, resulting in [hidden_dim].
+        weights_list = [
+            self.linear1.weight.detach().squeeze(),
+            self.linear2.weight.detach().squeeze(),
+            self.linear3.weight.detach().squeeze(),
+            self.linear4.weight.detach().squeeze()
+        ]
+        
+        # Stack weights into a matrix. Resulting shape: [4, hidden_dim].
+        # This creates a new tensor. Since original weights were detached,
+        # this operation is also outside the computation graph.
+        weights_matrix = torch.stack(weights_list)
+        
+        # Normalize each weight vector (row) using L2 norm.
+        # torch.nn.functional.normalize handles epsilon for numerical stability.
+        normalized_weights = torch.nn.functional.normalize(weights_matrix, p=2, dim=1)
+        
+        # Compute cosine similarity matrix by matrix multiplication: W_norm @ W_norm.T
+        # Resulting shape: [4, 4].
+        similarity_matrix = torch.matmul(normalized_weights, normalized_weights.t())
+        
+        # print("Normed Dot Product (Cosine Similarity) Matrix of Linear Layer Weights:")
+        return (similarity_matrix)
+        
+    def compute_weight_correlation(self):
+        """
+        Computes the mean absolute correlation between the weights of the linear layers.
+        This is fully differentiable and can be used as a regularization term.
+        
+        Returns:
+            torch.Tensor: Mean absolute correlation between all pairs of weight vectors
+        """
+        # Get weights without detaching to maintain gradient flow
+        weights_list = [
+            self.linear1.weight.squeeze(),
+            self.linear2.weight.squeeze(),
+            self.linear3.weight.squeeze(),
+            self.linear4.weight.squeeze()
+        ]
+        
+        # Stack weights into a matrix. Shape: [4, hidden_dim]
+        weights_matrix = torch.stack(weights_list)
+        
+        # Normalize each weight vector (row) using L2 norm
+        normalized_weights = torch.nn.functional.normalize(weights_matrix, p=2, dim=1)
+        
+        # Compute cosine similarity matrix. Shape: [4, 4]
+        similarity_matrix = torch.matmul(normalized_weights, normalized_weights.t())
+        
+        # Create a mask to exclude self-correlations (diagonal elements)
+        mask = torch.ones_like(similarity_matrix) - torch.eye(4, device=similarity_matrix.device)
+        
+        # Calculate mean absolute correlation (excluding diagonal)
+        # Take absolute values to penalize both positive and negative correlations
+        mean_abs_correlation = (torch.abs(similarity_matrix) * mask).sum() / (mask.sum())
+        
+        return mean_abs_correlation
+    
+    def minimize_weight_correlation_loss(self, lambda_corr=0.1):
+        """
+        Computes a loss term to minimize correlation between classifier weights.
+        This can be added to the main loss function during training.
+        
+        Args:
+            lambda_corr (float): Weight for the correlation penalty
+            
+        Returns:
+            torch.Tensor: Weighted correlation loss
+        """
+        correlation = self.compute_weight_correlation()
+        return lambda_corr * correlation
