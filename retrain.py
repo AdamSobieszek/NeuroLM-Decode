@@ -17,7 +17,7 @@ import torch._dynamo.config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model.model_vq import VQ_Align
+from model.model_inner_speech_transformer import VQ_Align
 from model.model_neural_transformer import NTConfig
 # from InnerSpeechMVPv1.src.data_utils.neurolm_dataloaders import ThinkingOutLoudLoader as PickleLoader
 from dataset import PickleLoader
@@ -36,7 +36,6 @@ def signal_handler(sig, frame):
     global running
     print('Keyboard interrupt received. Saving checkpoint and exiting...')
     running = False
-
 
 def init(args):
     global ctx, master_process, ddp, ddp_world_size, ddp_rank, device, dtype, device_type, ddp_local_rank,dtype
@@ -95,7 +94,7 @@ def save_checkpoint(raw_model, optimizer, encoder_args, decoder_args, iter_num, 
 
 def main(args):
     global ctx, master_process, ddp, ddp_world_size, ddp_rank, device, dtype, device_type, ddp_local_rank, running
-
+    global epoch, iter_num, raw_model, optimizer, encoder_args, decoder_args, checkpoint_out_dir
     # Register signal handler for keyboard interrupts
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -111,6 +110,9 @@ def main(args):
     # tuh = Path("/workspace/tuh_full/train").rglob('*.pkl')
     # files += [file for file in tuh]
     dataset_train = PickleLoader(files)
+    files = Path(args.dataset_dir+"_test").rglob('*.pkl')
+    files = [file for file in files]
+    dataset_test = PickleLoader(files)
     print('finished!')
 
     if ddp:
@@ -135,6 +137,14 @@ def main(args):
             drop_last=True,
             shuffle=True
         )
+
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test,
+        batch_size=args.batch_size*2,
+        num_workers=10,
+        pin_memory=True,
+        drop_last=True,
+    )
     print(dtype)
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
     iter_num = 0
@@ -237,7 +247,7 @@ def main(args):
         local_iter_num = 0 # number of iterations in the lifetime of this process
         raw_model = model.module if ddp else model # unwrap DDP container if needed
         losses = {}
-        iter_num = iter_num%(num_training_steps_per_epoch*args.epochs)
+        iter_num = local_iter_num#iter_num%(num_training_steps_per_epoch*args.epochs)
         # model.VQ.force_update_alpha(-3.0)
         for epoch in range(start_epoch, 100000):
             if not running:
@@ -249,6 +259,9 @@ def main(args):
                         break
                         
                     # determine and set the learning rate for this iteration
+                    if iter_num >= len(lr_schedule_values):
+                        raise Exception("training finished")
+                        
                     lr_fast = lr_schedule_values[iter_num] if args.decay_lr else args.learning_rate
                     lr_slow = lr_schedule_values_delayed[iter_num] if args.decay_lr else args.learning_rate
                     for lr,ii,param_group in zip([lr_slow,lr_slow,lr_fast,lr_fast,lr_fast], [1.,1., 1., 1., 200.], optimizer.param_groups):
@@ -322,7 +335,7 @@ def main(args):
                         optimizer.zero_grad(set_to_none=True)
                         
                     # evaluate the loss on train/val sets and wxrite checkpoints
-                    if (iter_num + 1) % args.log_interval == 0 and master_process:
+                    if (iter_num + 1) % args.log_interval == 0 and master_process and running:
                         M = lambda k: sum(losses[k])/len(losses[k])
                         with torch.no_grad():
                             _alpha = f"{model.VQ.sigmodule_alpha.data}"
@@ -337,11 +350,58 @@ def main(args):
                 
                     iter_num += 1
                     local_iter_num += 1
+                
+                # Run validation at the end of each epoch
+                if running:
+                    print(f"Running validation for epoch {epoch}")
+                    val_losses = {}
+                    model.eval()
+                    try:
+                        with torch.no_grad():
+                            for val_step, (val_batch) in enumerate(data_loader_test):
+                                X, Y_freq, Y_raw, input_chans, input_time, input_mask, target = val_batch
+                                X = X.float().to(device, non_blocking=True).to(ptdtype)
+                                Y_freq = Y_freq.float().to(device, non_blocking=True).to(ptdtype)
+                                Y_raw = Y_raw.float().to(device, non_blocking=True).to(ptdtype)
+                                input_chans = input_chans.to(device, non_blocking=True)
+                                input_time = input_time.to(device, non_blocking=True)
+                                input_mask = input_mask.to(device, non_blocking=True)
+                                
+                                try:
+                                    val_loss, _, val_log = model(X, Y_freq, Y_raw, input_chans, input_time, input_mask, target=target)
+                                    
+                                    for k, v in val_log.items():
+                                        k = k.replace('train/', 'val/')  # Change prefix from train to val
+                                        if k not in val_losses:
+                                            val_losses[k] = []
+                                        val_losses[k].append(v)
+                                except RuntimeError as e:
+                                    if "CUDA error: an illegal memory access was encountered" in str(e):
+                                        print(f"CUDA memory error during validation batch {val_step}, skipping this batch")
+                                        torch.cuda.empty_cache()
+                                        continue
+                                    else:
+                                        raise e
+                        
+                            # Print validation results if we have any data
+                            if val_losses:
+                                M_val = lambda k: sum(val_losses[k])/len(val_losses[k])
+                                print(f"Validation epoch {epoch}: val loss {M_val('val/total_loss'):.4f}, freq loss {M_val('val/rec_freq_loss'):.4f}, raw loss {M_val('val/rec_raw_loss'):.4f}")
+                                print(f"Val Domain loss: {M_val('val/domain_loss'):.4f}, Accuracy: {M_val('val/accuracy'):.4f}, Contrastive loss: {M_val('val/contrastive_loss'):.4f}, Similarity matrix: {M_val('val/similarity_matrix'):.4f}")
+                            else:
+                                print(f"No valid batches processed during validation for epoch {epoch}")
+                    except Exception as e:
+                        print(f"Error during validation: {e}")
+                        # Clear CUDA cache to potentially recover
+                        torch.cuda.empty_cache()
+                        
+                        model.train()
             except Exception as e:
-                print(f"Exception occurred: {e}")
+                if running:
+                    print(f"Exception occurred: {e}")
                 raise e
                 continue
-            if (epoch + 1) % args.save_ckpt_freq == 0 and master_process:
+            if (epoch + 1) % args.save_ckpt_freq == 0 and master_process and running:
                 print(f"saving checkpoint {epoch} to {checkpoint_out_dir}")
                 torch.save({
                     'model': raw_model.state_dict(),
@@ -354,7 +414,7 @@ def main(args):
 
     except Exception as e:
         print(f"Exception occurred: {e}")
-        print(iter_num, epoch, local_iter_num)
+        print(f"iter_num: {iter_num}, epoch: {epoch}, local_iter_num: {local_iter_num}")
         
         # Save checkpoint on exception
         if local_iter_num>10:
@@ -385,7 +445,7 @@ def get_args():
     parser.add_argument('--latent_dim', default=32, type=int)
     parser.add_argument('--text_batch_size', default=16, type=int)
     parser.add_argument('--epochs', default=100, type=int)
-    parser.add_argument('--warmup_epochs', default=0, type=int)
+    parser.add_argument('--warmup_epochs', default=1, type=int)
     parser.add_argument('--save_ckpt_freq', default=3, type=int)
     parser.add_argument('--block_size', default=1024, type=int)
 
