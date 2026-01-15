@@ -13,7 +13,7 @@ class HuberLoss(nn.Module):
         # Ensure predictions and targets have the same shape
         if predictions.shape != targets.shape:
             raise ValueError(f"Predictions shape {predictions.shape} must match targets shape {targets.shape}")
-            
+        targets = targets.to(dtype=predictions.dtype)        
         error = targets - predictions
         abs_error = torch.abs(error)
         
@@ -24,9 +24,9 @@ class HuberLoss(nn.Module):
         loss_values = torch.zeros_like(predictions, dtype=predictions.dtype)
         
         # Quadratic part for elements where |error| <= delta
-        loss_values[quadratic_part_condition] = 0.5 * error[quadratic_part_condition].pow(2)
+        loss_values[quadratic_part_condition] = 0.5 * error[quadratic_part_condition].pow(2).to(dtype=predictions.dtype)
         
         # Linear part for elements where |error| > delta
-        loss_values[linear_part_condition] = self.delta * (abs_error[linear_part_condition] - 0.5 * self.delta)
+        loss_values[linear_part_condition] = self.delta * (abs_error[linear_part_condition] - 0.5 * self.delta).to(dtype=predictions.dtype)
         
         return loss_values.mean()

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import math
+import numpy as np
 
 class LBLMInputProcessor(nn.Module):
     def __init__(self, patch_length, patch_stride, embed_dim, num_subjects, subject_embed_dim,
@@ -23,14 +24,30 @@ class LBLMInputProcessor(nn.Module):
         
         self.positional_encoding = nn.Parameter(torch.zeros(1, max_patches_per_channel, embed_dim), requires_grad=False)
         self._init_positional_encoding(max_patches_per_channel, embed_dim)
+        self.max_patches_per_channel = 30
 
         if num_subjects > 0 and subject_embed_dim > 0:
-            self.subject_gain = nn.Embedding(num_subjects, 1) # Learnable scalar gain
+            self.subject_gain = nn.Embedding(num_subjects, subject_embed_dim) # Learnable scalar gain
             nn.init.ones_(self.subject_gain.weight) # Initialize to ones
-            if subject_embed_dim != 1:
-                 print(f"Warning: LBLMInputProcessor created with subject_embed_dim={subject_embed_dim}. LBLM paper implies scalar gain (dim=1).")
+            # assert subject_embed_dim in [1, embed_dim, embed_dim//2 ], "subject_embed_dim must be 1 or embed_dim"
         else:
             self.subject_gain = None
+    def cut_subject_gain(self): # TODO: This is a hack to change stride, remove
+        """Properly resize the subject gain embedding by creating a new Embedding layer with reduced size"""
+        if self.subject_gain is not None:
+            old_weight = self.subject_gain.weight[:,:-1]  # Remove last dimension
+            new_embed_dim = old_weight.shape[1]
+            num_subjects = self.subject_gain.num_embeddings
+            
+            # Create new embedding layer with reduced size
+            new_subject_gain = nn.Embedding(num_subjects, new_embed_dim).to(self.subject_gain.weight.device)
+            
+            # Copy over the weights
+            with torch.no_grad():
+                new_subject_gain.weight.copy_(old_weight)
+                
+            # Replace old embedding
+            self.subject_gain = new_subject_gain
 
     def _init_positional_encoding(self, max_len, d_model):
         if max_len <=0:
@@ -90,22 +107,46 @@ class LBLMInputProcessor(nn.Module):
             # Dynamically extend positional encoding if needed (or error out)
             # For now, error out as LBLM implies fixed size or pre-calculated max.
             raise ValueError(f"Actual num_patches_seq ({num_patches_seq}) exceeds pre-calculated max_len for positional encoding ({self.positional_encoding.shape[1]}). Adjust max_patches_per_channel in init.")
-        
+
         embedded_patches = embedded_patches + self.positional_encoding[:, :num_patches_seq, :]
 
         # 5. Apply Subject Embedding
         if self.subject_gain is not None and subject_ids is not None:
             if subject_ids.max() >= self.subject_gain.num_embeddings:
-                raise ValueError("subject_id out of range for subject_gain embedding.")
-            gains = self.subject_gain(subject_ids) # [B, 1]
-            gains_expanded = gains.repeat_interleave(num_channels, dim=0).unsqueeze(-1) # [B*M, 1, 1]
-            embedded_patches = embedded_patches * gains_expanded
+                raise ValueError(f"subject_id out of range for subject_gain embedding. Got {subject_ids.max()}, max allowed is {self.subject_gain.num_embeddings-1}")
+ # [B*M, 1, 1]
+            try:
+                gains = self.subject_gain(subject_ids) # [B, 1]
+                gains_expanded = gains.repeat_interleave(num_channels, dim=0).unsqueeze(-2) # [B*M, 1, 1]
+                embedded_patches = embedded_patches * gains_expanded
+            except:
+                self.cut_subject_gain()
+                gains = self.subject_gain(subject_ids) # [B, 1]
+                gains_expanded = gains.repeat_interleave(num_channels, dim=0).unsqueeze(-2) # [B*M, 1, 1]
+                embedded_patches = embedded_patches * gains_expanded
         elif self.subject_gain is not None and subject_ids is None:
             print("Warning: LBLMInputProcessor subject_gain is enabled but subject_ids not provided in forward pass.")
 
         # 6. Masking for MSTP
-        token_mask_prob = torch.rand(batch_size * num_channels, num_patches_seq, device=x_raw_eeg.device)
+        token_mask_prob = torch.rand(batch_size * num_channels, num_patches_seq, device=x_raw_eeg.device)*(1+np.random.rand() if self.training else 1) # TODO Remove if not needed
         # True where token is masked (to be predicted)
         masked_indices_bool = token_mask_prob < self.mask_ratio
 
+
+        def smooth_mask(masked_indices_bool, p, i):
+            if np.random.rand() < p:
+                masked_indices_bool[i,1:] = masked_indices_bool[i,1:]|masked_indices_bool[i,:-1]
+            if np.random.rand() < p:
+                masked_indices_bool[i,:-1] = masked_indices_bool[i,:-1]|masked_indices_bool[i,1:]
+            if np.random.rand() < p/2:
+                masked_indices_bool[i,:-1] = masked_indices_bool[i,:-1]|masked_indices_bool[i,1:]
+            return masked_indices_bool
+
+
+        if not self.training:
+            for i in range(masked_indices_bool.shape[0]):
+                masked_indices_bool = smooth_mask(masked_indices_bool, 0.5, i)
+        else:
+            i = [*range(masked_indices_bool.shape[0])]
+            masked_indices_bool = smooth_mask(masked_indices_bool, 0.5, i)
         return embedded_patches, original_patches_for_target, masked_indices_bool, rev_in_mean, rev_in_std

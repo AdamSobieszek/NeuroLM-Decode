@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model.model_neurolm import NeuroLM
-from model.model_vq import VQ
+from model.model_inner_speech_transformer import VQ
 from model.model_neural_transformer import NTConfig
 from model.model import GPTConfig
 from dataset import PickleLoader

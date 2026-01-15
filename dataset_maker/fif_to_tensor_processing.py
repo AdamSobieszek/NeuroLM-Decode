@@ -53,6 +53,7 @@ def single_fif_to_tensor(single_fif: mne.io.Raw,
     n_repetitions = string_to_dictionary(single_fif.info['description'])['experiment_description']['n_repetitions']
 
     events, event_id = mne.events_from_annotations(single_fif, verbose=verbose)
+    print(events)
     epochs = mne.Epochs(single_fif, events=events, event_id=event_id, tmin=tmin, tmax=tmax, baseline=baseline, verbose=verbose)
     epochs_data = epochs.get_data(verbose=verbose)
 

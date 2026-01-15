@@ -14,7 +14,7 @@ import torch._dynamo.config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model.model_vq import VQ_Align
+from model.model_inner_speech_transformer import VQ_Align
 from model.model_neural_transformer import NTConfig
 from dataset import PickleLoader
 from pathlib import Path

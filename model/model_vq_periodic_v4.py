@@ -27,7 +27,7 @@ def calculate_and_plot_fft_power(periodic_output, rec_raw, fs=200, save_plot=Tru
     periodic_output : torch.Tensor or numpy.ndarray
         The output from the periodic decoder
     rec_raw : torch.Tensor or numpy.ndarray
-        The raw reconstruction output
+        The raw reconstru ction output
     fs : int
         Sampling frequency in Hz (default: 200)
     save_plot : bool

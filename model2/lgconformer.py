@@ -19,7 +19,7 @@ class ConvolutionModule(nn.Module):
         super().__init__()
         self.layer_norm = nn.LayerNorm(d_model)
         self.pointwise_conv1 = nn.Conv1d(
-            in_channels=d_model,``
+            in_channels=d_model,
             out_channels=d_model * expansion_factor, # Expand
             kernel_size=1,
             stride=1,

@@ -162,21 +162,27 @@ class LayerGatedConformerBlock(nn.Module):
     def _conformer_transform(self, x_input, attention_mask=None):
         x = x_input
         
-        # FFN1 + residual
-        x = x + 0.5 * self.ffn1(x) # Common to scale FFN residual
+        # First FeedForward (scaled residual)
+        x_res_ffn1 = self.ffn1(x)
+        x = x + 0.5 * x_res_ffn1
 
-        # MHSA + residual
-        x = x + self.mhsa(x, attention_mask=attention_mask)
+        # Multi-Head Self-Attention (direct residual)
+        x_res_mhsa = self.mhsa(x, attention_mask=attention_mask)
+        x = x + x_res_mhsa
         
-        # ConvModule + residual
-        x = x + self.conv_module(x)
+        # Convolution Module (scaled residual)
+        x_res_conv = self.conv_module(x)
+        x = x + 0.5 * x_res_conv # Assuming 0.5 scaling as per diagram's notation
 
-        # FFN2 + residual
-        x = x + 0.5 * self.ffn2(x) # Common to scale FFN residual
-
-        transformed_x = self.final_layer_norm(x)
+        # Second Feed Forward (direct residual as per diagram's simple "+")
+        x_res_ffn2 = self.ffn2(x)
+        x = x + x_res_ffn2 # Changed from 0.5 * scaling to direct add based on Fig 3
+    
+        transformed_x = self.final_layer_norm(x) # Final LN on the transformed output
         return transformed_x
 
+
+        
     def forward(self, x_prev_layer, attention_mask=None):
         # x_prev_layer (e_l_minus_1): [batch_size, seq_len, d_model]
         
